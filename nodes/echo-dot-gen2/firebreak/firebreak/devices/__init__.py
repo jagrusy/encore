@@ -1,0 +1,43 @@
+from __future__ import annotations
+
+from firebreak.devices.biscuit import BISCUIT
+from firebreak.devices.crown import CROWN
+from firebreak.devices.donut import DONUT
+from firebreak.devices.radar import RADAR
+from firebreak.devices.registry import (
+    ADB_OFF_BUILDS,
+    BOOTROM_UNLOCKS,
+    BUILDS,
+    BY_NAME,
+    DEFAULT_BUILDS,
+    DEFAULTS,
+    DEVICES,
+    FASTBRICKS,
+    FIREOS5_BUILDS,
+    FIREOS5_CHAINS,
+    KAMAKIRI_UNLOCKS,
+    LITTLE_KERNEL_DESCRIPTION,
+    LK_VALUES,
+    TARGETS,
+)
+
+__all__ = [
+    "ADB_OFF_BUILDS",
+    "BISCUIT",
+    "BOOTROM_UNLOCKS",
+    "BUILDS",
+    "BY_NAME",
+    "CROWN",
+    "DEFAULTS",
+    "DEFAULT_BUILDS",
+    "DEVICES",
+    "DONUT",
+    "FASTBRICKS",
+    "FIREOS5_BUILDS",
+    "FIREOS5_CHAINS",
+    "KAMAKIRI_UNLOCKS",
+    "LITTLE_KERNEL_DESCRIPTION",
+    "LK_VALUES",
+    "RADAR",
+    "TARGETS",
+]

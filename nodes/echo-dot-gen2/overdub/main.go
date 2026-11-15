@@ -1,0 +1,96 @@
+// Command overdub takes over the Echo Dot's action button and presents the Dot
+// to Home Assistant as an ESPHome device, leaving Amazon's stack alone.
+package main
+
+import (
+	"crypto/ed25519"
+	"crypto/x509"
+	_ "embed"
+	"encoding/pem"
+	"errors"
+	"flag"
+	"fmt"
+	"log"
+	"os"
+	"strings"
+)
+
+var version string
+
+//go:embed deploy/release-signing.pub
+var releaseKeyPEM []byte
+
+func releaseKey() (ed25519.PublicKey, error) {
+	block, _ := pem.Decode(releaseKeyPEM)
+	if block == nil || block.Type != "PUBLIC KEY" {
+		return nil, errors.New("deploy/release-signing.pub holds no PUBLIC KEY block")
+	}
+	parsed, err := x509.ParsePKIXPublicKey(block.Bytes)
+	if err != nil {
+		return nil, err
+	}
+	key, ok := parsed.(ed25519.PublicKey)
+	if !ok {
+		return nil, fmt.Errorf("deploy/release-signing.pub holds a %T, not an ed25519 key", parsed)
+	}
+	return key, nil
+}
+
+func versionLine() string {
+	if version == "" {
+		return "overdub (unversioned build)"
+	}
+	return "overdub " + version
+}
+
+func main() {
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+	log.SetOutput(os.Stdout)
+
+	var flags config
+	flag.StringVar(&flags.Name, "name", "", "unique device name Home Assistant identifies this Dot by (required)")
+	showVersion := flag.Bool("version", false, "print the version and exit")
+	flag.Parse()
+
+	if *showVersion {
+		fmt.Println(versionLine())
+		return
+	}
+
+	if flags.Name == "" {
+		fmt.Fprintln(os.Stderr, "overdub: -name is required, and must be unique on the network")
+		os.Exit(2)
+	}
+
+	if err := checkName(flags.Name); err != nil {
+		fmt.Fprintf(os.Stderr, "overdub: %v\n", err)
+		os.Exit(2)
+	}
+
+	log.Print(versionLine())
+
+	if err := serve(flags); err != nil {
+		stopping()
+		log.Printf("overdub: %v", err)
+		os.Exit(1)
+	}
+}
+
+type config struct {
+	Name string
+}
+
+func checkName(name string) error {
+	if len(name) > 63 {
+		return fmt.Errorf("-name is %d characters; a DNS label stops at 63", len(name))
+	}
+	if strings.HasPrefix(name, "-") || strings.HasSuffix(name, "-") {
+		return fmt.Errorf("-name must not start or end with -; that is not a valid DNS label")
+	}
+	for _, r := range name {
+		if !(r >= 'a' && r <= 'z') && !(r >= '0' && r <= '9') && r != '-' && r != '_' {
+			return fmt.Errorf("-name must be lowercase letters, digits, - or _: %q", name)
+		}
+	}
+	return nil
+}

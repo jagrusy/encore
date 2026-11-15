@@ -1,0 +1,513 @@
+from __future__ import annotations
+
+import re
+import subprocess
+import sys
+import types
+from typing import TYPE_CHECKING
+
+import pytest
+
+from firebreak import identify, support, ui, unlock
+from firebreak.devices import BISCUIT, RADAR, biscuit
+from firebreak.identify import Identity, UsbDevice
+from firebreak.states import State
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from conftest import FakeAdb
+
+FLAT = "FAILED (remote: 'unknown command'); fastboot: error: Command failed"
+LISTING = (
+    "lrwxrwxrwx root root 2026-10-11 00:00 cache -> /dev/block/mmcblk0p3\n"
+    f"{support.LISTING_OK}"
+)
+PARTITIONS = (
+    f"major minor  #blocks  name\n 179  3  65536 mmcblk0p3\n{support.PARTITIONS_OK}"
+)
+REFUSAL = "FAILED (remote: 'unknown command')\nfastboot: error: Command failed"
+
+USB = (
+    UsbDevice(
+        manufacturer="MediaTek",
+        product="AEORD",
+        product_id=0x201C,
+        serial="G0X1ABCDEF",
+        vendor_id=0x0E8D,
+    ),
+    UsbDevice(
+        manufacturer="Apple",
+        product="Keyboard",
+        product_id=1,
+        serial="",
+        vendor_id=0x05AC,
+    ),
+)
+
+
+class Dot:
+    @property
+    def place(self) -> str:
+        return self.places[0]
+
+    def __init__(self, *, places: list[str]) -> None:
+        self.places = places
+        self.ran: list[list[str]] = []
+        self.said: dict[str, str] = {
+            "getprop ro.twrp.version": "3.7.0_9-0",
+            "getprop sys.usb.config": "mtp,adb",
+            "id; su -c id": "uid=0(root)",
+        }
+        self.hangs: set[str] = set()
+        self.refuses: set[str] = set()
+        self.variables = {
+            "antirback_lk_version": "0x0001",
+            "antirback_pl_version": "0x0005",
+            "antirback_tee_version": "0x0102",
+            "lk_build_desc": "f379dba-20170906_000423",
+            "product": "BISCUIT",
+            "unlock_status": "true",
+        }
+
+    def adb_shell(self, *, command: str, timeout: float) -> str:
+        del timeout
+        if command == "getprop sys.usb.config" and len(self.places) > 1:
+            self.places.pop(0)
+            return ""
+        return self.said.get(command, "")
+
+    def adb_state(self, *, timeout: float = 30) -> str:
+        if not self.usb_serial():
+            return ""
+        return self.run(arguments=["adb", "get-state"], timeout=timeout).stdout.strip()
+
+    def getvar(self, *, name: str) -> str:
+        return self.variables[name]
+
+    def in_fastboot(self) -> bool:
+        return self.place == "fastboot"
+
+    def run(self, *, arguments: list[str], timeout: float) -> types.SimpleNamespace:
+        del timeout
+        self.ran.append(arguments)
+        if " ".join(arguments) in self.hangs:
+            raise subprocess.TimeoutExpired(cmd=arguments, timeout=60)
+        if " ".join(arguments) in self.refuses:
+            return types.SimpleNamespace(returncode=1, stdout=REFUSAL)
+        if arguments[-1] == "wait-for-recovery":
+            if "lost" in self.places:
+                raise subprocess.TimeoutExpired(cmd=arguments, timeout=180)
+            self.places.pop(0)
+        if arguments[-1] == "get-state":
+            return types.SimpleNamespace(returncode=0, stdout=self.place + "\n")
+        return types.SimpleNamespace(returncode=0, stdout="")
+
+    def usb_serial(self) -> str | None:
+        if self.place != "nothing":
+            return "G000"
+        if len(self.places) > 1:
+            self.places.pop(0)
+        return None
+
+
+@pytest.fixture
+def legs(*, monkeypatch: pytest.MonkeyPatch) -> list[dict[str, object]]:
+    ran: list[dict[str, object]] = []
+    monkeypatch.setattr(name="probed", target=support, value=lambda: "none")
+    monkeypatch.setattr(name="into_recovery", target=support, value=lambda **_: True)
+    monkeypatch.setattr(name="usb_leg", target=support, value=lambda **_: 4)
+    monkeypatch.setattr(
+        name="emmc_leg", target=support, value=lambda **o: ran.append(o)
+    )
+    monkeypatch.setattr(name="mmc_said", target=support, value=lambda **_: ["mmc"])
+    return ran
+
+
+@pytest.fixture
+def lines() -> list[tuple[str, object]]:
+    return []
+
+
+@pytest.fixture
+def shown(*, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    texts: list[str] = []
+    monkeypatch.setattr(
+        name="show", target=support, value=lambda **said: texts.append(said["text"])
+    )
+    monkeypatch.setattr(
+        name="run",
+        target=support,
+        value=lambda **_: types.SimpleNamespace(stdout="Android Debug Bridge 1.0.41\n"),
+    )
+    monkeypatch.setattr(name="probed", target=support, value=lambda: "none")
+    monkeypatch.setattr(name="dot_details", target=support, value=lambda **_: ["dot"])
+    monkeypatch.setattr(name="mmc_said", target=support, value=lambda **_: ["mmc"])
+    monkeypatch.setattr(
+        name="identify",
+        target=identify,
+        value=lambda **_: Identity(device=RADAR, how="USB product 'AEORD'"),
+    )
+    monkeypatch.setattr(name="usb_devices", target=identify, value=lambda: [*USB])
+    return texts
+
+
+def dot(*, monkeypatch: pytest.MonkeyPatch, places: list[str]) -> Dot:
+    fake = Dot(places=places)
+    for name in (
+        "adb_shell",
+        "adb_state",
+        "getvar",
+        "in_fastboot",
+        "run",
+        "usb_serial",
+    ):
+        for module in (support, unlock):
+            if hasattr(module, name):
+                monkeypatch.setattr(name=name, target=module, value=getattr(fake, name))
+    monkeypatch.setattr(name="sleep", target=support.time, value=lambda _: None)
+    return fake
+
+
+def recorder(*, lines: list[tuple[str, object]]) -> Callable[[str, object], None]:
+    return lambda label, value: lines.append((label, value))
+
+
+def test_a_reason_after_a_status_starts_its_own_line(
+    *,
+    capsys: pytest.CaptureFixture[str],
+    lines: list[tuple[str, object]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(name="isatty", target=sys.stdout, value=lambda: True)
+    fake = dot(monkeypatch=monkeypatch, places=["nothing", "device"])
+    fake.said["id; su -c id"] = "uid=1000"
+    assert support.into_recovery(line=recorder(lines=lines)) is False
+    plain = re.sub(pattern=r"\033\[[0-9;]*m", repl="", string=capsys.readouterr().out)
+    assert any(row.startswith("This Echo Dot") for row in plain.split(sep="\n"))
+
+
+def test_a_report_answers_nothing_for_a_silent_read(
+    *, adb: FakeAdb, monkeypatch: pytest.MonkeyPatch, shown: list[str]
+) -> None:
+    del adb
+    said: list[str] = []
+
+    def details(*, asked: Callable[..., str]) -> list[str]:
+        said.append(asked(command="getprop ro.serialno"))
+        return []
+
+    monkeypatch.setattr(name="into_recovery", target=support, value=lambda **_: True)
+    monkeypatch.setattr(name="dot_details", target=support, value=details)
+    support.report()
+    assert said == ["<nothing>"]
+    assert shown
+
+
+def test_a_report_names_the_device_it_found_in_what_follows(
+    *, monkeypatch: pytest.MonkeyPatch, shown: list[str]
+) -> None:
+    monkeypatch.setattr(name="target", target=ui.ARGUMENTS, value="")
+    monkeypatch.setattr(name="into_recovery", target=support, value=lambda **_: False)
+    support.report()
+    assert shown
+    assert ui.SESSION.named == RADAR.title
+    assert support.left_in_recovery() == (
+        f"The {RADAR.title} stays in TWRP: adb reboot leaves TWRP for Fire OS."
+    )
+
+
+def test_a_report_names_the_firebreak_version(
+    *, monkeypatch: pytest.MonkeyPatch, shown: list[str]
+) -> None:
+    monkeypatch.setattr(name="into_recovery", target=support, value=lambda **_: False)
+    support.report()
+    assert support.labelled(label="firebreak version", value=support.__version__) in (
+        shown
+    )
+    device = "Echo (2nd Generation), by its USB product 'AEORD'"
+    assert (
+        support.labelled(label="device", value=device)
+        + "\n"
+        + support.labelled(label="usb", value=USB[0])
+    ) in shown
+    assert not any("Keyboard" in text for text in shown)
+    for tool in ("adb", "fastboot"):
+        assert support.labelled(label=tool, value="Android Debug Bridge 1.0.41") in (
+            shown
+        )
+    assert shown[-1] == "The report stops with what is above."
+
+
+def test_a_report_reads_no_system_image_for_an_echo_with_no_fire_os_5(
+    *,
+    adb: FakeAdb,
+    monkeypatch: pytest.MonkeyPatch,
+    shown: list[str],
+) -> None:
+    held = support.CACHE / f"system-{biscuit.BUILDS['5.5.5.4'].sha256[:12]}" / "md5"
+    held.parent.mkdir(parents=True)
+    held.write_text("abc 2 1\n")
+    monkeypatch.setattr(name="into_recovery", target=support, value=lambda **_: True)
+    adb.answers["ls -l"] = [LISTING]
+    adb.answers["cat /proc/partitions"] = [PARTITIONS]
+    support.report()
+    text = "\n".join(shown)
+    assert "no Fire OS 5 build" in text
+    assert "md5 abc" not in text
+    assert "system_a spare" not in text
+
+
+@pytest.mark.parametrize("built", [False, True])
+def test_a_report_reads_the_dot_s_recovery(
+    *,
+    adb: FakeAdb,
+    built: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    shown: list[str],
+) -> None:
+    if built:
+        held = support.CACHE / f"system-{biscuit.BUILDS['5.5.5.4'].sha256[:12]}" / "md5"
+        held.parent.mkdir(parents=True)
+        held.write_text("abc 2 1\n")
+    monkeypatch.setattr(
+        name="identify",
+        target=identify,
+        value=lambda **_: Identity(device=BISCUIT, how="USB product 'AEOBC'"),
+    )
+    monkeypatch.setattr(name="into_recovery", target=support, value=lambda **_: True)
+    adb.answers["ls -l"] = [LISTING]
+    adb.answers["cat /proc/partitions"] = [PARTITIONS]
+    support.report()
+    text = "\n".join(shown)
+    assert "dot" in shown
+    assert "mmc" in shown
+    if built:
+        assert "8192 bytes, md5 abc" in text
+    else:
+        assert "not built yet" in text
+    assert shown[-1] == "\n" + support.left_in_recovery()
+
+
+def test_into_recovery_asks_nothing_more_once_fastboot_is_gone(
+    *,
+    lines: list[tuple[str, object]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = dot(monkeypatch=monkeypatch, places=["fastboot", "recovery"])
+    fake.refuses.add("fastboot oem reboot-recovery")
+    monkeypatch.setattr(name="in_fastboot", target=unlock, value=lambda: False)
+    assert support.into_recovery(line=recorder(lines=lines)) is True
+    assert ["fastboot", "reboot-recovery"] not in fake.ran
+    assert lines[-1][0] != "fastboot oem reboot-recovery"
+
+
+def test_into_recovery_asks_nothing_more_when_fastboot_hangs(
+    *,
+    lines: list[tuple[str, object]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = dot(monkeypatch=monkeypatch, places=["fastboot", "recovery"])
+    fake.hangs.add("fastboot oem reboot-recovery")
+    assert support.into_recovery(line=recorder(lines=lines)) is True
+    assert ["fastboot", "reboot-recovery"] not in fake.ran
+
+
+def test_into_recovery_asks_the_oem_restart_first(
+    *,
+    lines: list[tuple[str, object]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = dot(monkeypatch=monkeypatch, places=["fastboot", "recovery"])
+    assert support.into_recovery(line=recorder(lines=lines)) is True
+    assert ["fastboot", "oem", "reboot-recovery"] in fake.ran
+    assert ["fastboot", "reboot-recovery"] not in fake.ran
+
+
+def test_into_recovery_falls_back_to_fastboot_s_own_restart(
+    *,
+    lines: list[tuple[str, object]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = dot(monkeypatch=monkeypatch, places=["fastboot", "recovery"])
+    fake.refuses.add("fastboot oem reboot-recovery")
+    assert support.into_recovery(line=recorder(lines=lines)) is True
+    assert ["fastboot", "reboot-recovery"] in fake.ran
+    assert ("fastboot oem reboot-recovery", FLAT) not in lines
+
+
+def test_into_recovery_gives_up_after_its_wait(
+    *, lines: list[tuple[str, object]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dot(monkeypatch=monkeypatch, places=["nothing"])
+    clock = iter(range(0, 10 * support.WAIT, support.WAIT // 2))
+    monkeypatch.setattr(
+        name="monotonic", target=support.time, value=lambda: next(clock)
+    )
+    assert support.into_recovery(line=recorder(lines=lines)) is False
+
+
+@pytest.mark.parametrize(
+    "places",
+    [
+        ["recovery"],
+        ["fastboot", "recovery"],
+        ["device", "recovery"],
+        ["recovery", "recovery"],
+        ["nothing", "nothing", "fastboot", "recovery"],
+    ],
+)
+def test_into_recovery_reaches_twrp_from_where_the_dot_is(
+    *,
+    capsys: pytest.CaptureFixture[str],
+    lines: list[tuple[str, object]],
+    monkeypatch: pytest.MonkeyPatch,
+    places: list[str],
+) -> None:
+    start = places[0]
+    fake = dot(monkeypatch=monkeypatch, places=places)
+    assert support.into_recovery(line=recorder(lines=lines)) is True
+    out = capsys.readouterr().out
+    if start == "fastboot":
+        assert ("fastboot product", "BISCUIT") in lines
+        assert ("fastboot antirback_pl_version", "0x0005") in lines
+        assert ["fastboot", "oem", "reboot-recovery"] in fake.ran
+    if start == "device":
+        assert ["adb", "reboot", "recovery"] in fake.ran
+    if start == "nothing":
+        assert out.count("comes from the Echo Dot (2nd Generation)'s recovery") == 1
+
+
+def test_into_recovery_reports_an_adb_reboot_that_did_not_answer(
+    *,
+    lines: list[tuple[str, object]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = dot(monkeypatch=monkeypatch, places=["device", "recovery"])
+    fake.refuses.add("adb reboot recovery")
+    assert support.into_recovery(line=recorder(lines=lines)) is True
+    assert ("adb reboot recovery", FLAT) in lines
+
+
+@pytest.mark.parametrize(
+    ("places", "change", "said"),
+    [
+        (["fastboot"], ("variables", "unlock_status", ""), "did not say whether"),
+        (["fastboot"], ("variables", "unlock_status", "false"), "is locked"),
+        (["recovery"], ("said", "getprop ro.twrp.version", ""), "not TWRP"),
+        (["device"], ("said", "id; su -c id", "uid=2000(shell)"), "without root"),
+        (["fastboot", "lost"], ("said", "", ""), "within 3 minutes"),
+    ],
+)
+def test_into_recovery_says_why_it_stops(  # ruff: ignore[too-many-arguments]
+    *,
+    capsys: pytest.CaptureFixture[str],
+    change: tuple[str, str, str],
+    lines: list[tuple[str, object]],
+    monkeypatch: pytest.MonkeyPatch,
+    places: list[str],
+    said: str,
+) -> None:
+    fake = dot(monkeypatch=monkeypatch, places=places)
+    table, key, value = change
+    getattr(fake, table)[key] = value
+    assert support.into_recovery(line=recorder(lines=lines)) is False
+    assert said in " ".join(capsys.readouterr().out.split())
+
+
+def test_into_recovery_stops_when_fastboot_refuses_the_restart(
+    *,
+    capsys: pytest.CaptureFixture[str],
+    lines: list[tuple[str, object]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = dot(monkeypatch=monkeypatch, places=["fastboot"])
+    fake.refuses.update({"fastboot reboot-recovery", "fastboot oem reboot-recovery"})
+    assert support.into_recovery(line=recorder(lines=lines)) is False
+    assert ["adb", "wait-for-recovery"] not in fake.ran
+    assert ("fastboot reboot-recovery", FLAT) in lines
+    assert ("fastboot oem reboot-recovery", FLAT) in lines
+    assert "refused to restart" in capsys.readouterr().out
+
+
+def test_the_write_test_cleans_up_after_a_failed_leg(
+    *, adb: FakeAdb, legs: list[dict[str, object]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    del legs
+
+    def fail(**_: object) -> int:
+        message = "leg"
+        raise RuntimeError(message)
+
+    monkeypatch.setattr(name="usb_leg", target=support, value=fail)
+    with pytest.raises(RuntimeError, match="leg"):
+        support.write_test()
+    assert adb.commands(holding="rm -f")
+
+
+def test_the_write_test_leaves_a_stale_hold_for_a_booted_echo(
+    *, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ran: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        name="bootrom_write_test", target=support, value=lambda **said: ran.append(said)
+    )
+    monkeypatch.setattr(name="state", target=support, value=lambda: State.ROOTED)
+    monkeypatch.setattr(name="into_recovery", target=support, value=lambda **_: False)
+    support.write_test()
+    assert ran == []
+
+
+def test_the_write_test_needs_a_recovery(
+    *,
+    capsys: pytest.CaptureFixture[str],
+    legs: list[dict[str, object]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(name="into_recovery", target=support, value=lambda **_: False)
+    support.write_test()
+    assert legs == []
+    assert "needs a recovery" in capsys.readouterr().out
+
+
+def test_the_write_test_on_a_held_echo_goes_through_the_bootrom(
+    *, legs: list[dict[str, object]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ran: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        name="amonet_payload", target=support, value=lambda: "payload.bin"
+    )
+    monkeypatch.setattr(
+        name="bootrom_write_test", target=support, value=lambda **said: ran.append(said)
+    )
+    monkeypatch.setattr(name="state", target=support, value=lambda: State.BOOTROM)
+    support.write_test()
+    assert legs == []
+    assert ran[0]["payload"] == "payload.bin"
+
+
+def test_the_write_test_runs_both_legs_and_cleans_up(
+    *, adb: FakeAdb, capsys: pytest.CaptureFixture[str], legs: list[dict[str, object]]
+) -> None:
+    adb.answers["toybox dd --help"] = ["yes"]
+    adb.answers["ls -l"] = [LISTING]
+    adb.answers["cat /proc/partitions"] = [PARTITIONS]
+    support.write_test()
+    assert legs[0]["node"] == "/dev/block/mmcblk0p3"
+    assert legs[0]["blocks"] == 64
+    assert legs[0]["chunk"] == 4
+    assert support.SESSION.dd == "toybox dd"
+    assert adb.commands(holding="rm -f") == [f"rm -f {support.USB_TEST}"]
+    assert capsys.readouterr().out.endswith(support.left_in_recovery() + "\n")
+
+
+def test_the_write_test_skips_the_emmc_leg_without_whole_lists(
+    *,
+    adb: FakeAdb,
+    capsys: pytest.CaptureFixture[str],
+    legs: list[dict[str, object]],
+) -> None:
+    adb.answers["ls -l"] = [subprocess.TimeoutExpired(cmd="adb", timeout=60)]
+    support.write_test()
+    assert legs == []
+    assert "did not arrive whole" in capsys.readouterr().out

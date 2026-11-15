@@ -1,0 +1,359 @@
+"""The connection routes inbound source binary + client_stream messages to roles."""
+
+from __future__ import annotations
+
+import logging
+from contextlib import nullcontext
+from typing import Any
+from unittest.mock import patch
+
+import pytest
+
+from aiosendspin.models import pack_binary_header_raw
+from aiosendspin.models.source import (
+    ClientStreamEndMessage,
+    ClientStreamStartMessage,
+    ClientStreamStartPayload,
+    ClientStreamStartSource,
+)
+from aiosendspin.models.types import AudioCodec, BinaryMessageType, ClientMessage
+from aiosendspin.server.compliance import ClientComplianceError
+from aiosendspin.server.connection import SendspinConnection
+from aiosendspin.server.roles.base import Role
+from aiosendspin.util import WARN_INTERVAL_S
+
+
+class _RecordingRole:
+    role_family = "source"
+
+    def __init__(self, *, consume: bool = True) -> None:
+        self.consume = consume
+        self.binary: list[tuple[int, int, bytes]] = []
+        self.starts: list[ClientStreamStartPayload] = []
+        self.ends = 0
+
+    def handles_inbound_binary(self, message_type: int) -> bool:
+        return self.consume and message_type == BinaryMessageType.SOURCE_AUDIO_CHUNK.value
+
+    on_binary_message = Role.on_binary_message
+
+    def on_binary_chunk(self, message_type: int, timestamp_us: int, data: bytes) -> None:
+        self.binary.append((message_type, timestamp_us, data))
+
+    def on_client_stream_start(self, payload: ClientStreamStartPayload) -> None:
+        self.starts.append(payload)
+
+    def on_client_stream_end(self) -> None:
+        self.ends += 1
+
+
+class _ApplicationRole:
+    role_family = "_vendor_echo"
+
+    def __init__(self) -> None:
+        self.messages: list[tuple[int, bytes]] = []
+
+    def handles_inbound_binary(self, message_type: int) -> bool:
+        return message_type == 200
+
+    def on_binary_message(self, message_type: int, data: bytes) -> None:
+        self.messages.append((message_type, data))
+
+
+class _FakeClient:
+    def __init__(self, roles: list[Any], *, strict: bool = False) -> None:
+        self._roles = roles
+        self._strict = strict
+        self.noncompliance: list[str] = []
+        self.available = True
+
+    def flag_noncompliance(self, reason: str) -> None:
+        self.noncompliance.append(reason)
+        if self._strict:
+            raise ClientComplianceError(reason)
+
+    @property
+    def active_roles(self) -> list[Any]:
+        return self._roles
+
+
+def _bare_connection(
+    roles: list[Any], *, strict: bool = False, starts: int = 0, input_open: bool = False
+) -> SendspinConnection:
+    conn = SendspinConnection.__new__(SendspinConnection)
+    conn._client = _FakeClient(roles, strict=strict)  # noqa: SLF001
+    conn._logger = logging.getLogger("test.source.dispatch")  # noqa: SLF001
+    conn._source_starts_pending = starts  # noqa: SLF001
+    conn._source_input_open = input_open  # noqa: SLF001
+    conn._unhandled_binary_count = 0  # noqa: SLF001
+    conn._last_unhandled_binary_log_s = None  # noqa: SLF001
+    return conn
+
+
+def _chunk(timestamp_us: int = 1) -> bytes:
+    return pack_binary_header_raw(BinaryMessageType.SOURCE_AUDIO_CHUNK.value, timestamp_us) + b"x"
+
+
+_PCM_START = ClientStreamStartMessage(
+    payload=ClientStreamStartPayload(
+        source=ClientStreamStartSource(
+            codec=AudioCodec.PCM, channels=2, sample_rate=48000, bit_depth=16
+        )
+    )
+)
+
+
+def test_inbound_binary_routed_to_source_role() -> None:
+    """A type-12 binary frame is parsed and delivered with header ts + payload."""
+    role = _RecordingRole()
+    conn = _bare_connection([role], input_open=True)
+    frame = pack_binary_header_raw(BinaryMessageType.SOURCE_AUDIO_CHUNK.value, 42_000) + b"audio"
+    conn._route_inbound_binary(frame)  # noqa: SLF001
+    assert role.binary == [(BinaryMessageType.SOURCE_AUDIO_CHUNK.value, 42_000, b"audio")]
+
+
+def test_inbound_binary_stops_at_first_consuming_role() -> None:
+    """Routing stops at the first role declaring the chunk's type."""
+    first = _RecordingRole(consume=True)
+    second = _RecordingRole(consume=True)
+    conn = _bare_connection([first, second], input_open=True)
+    conn._route_inbound_binary(  # noqa: SLF001
+        pack_binary_header_raw(BinaryMessageType.SOURCE_AUDIO_CHUNK.value, 1) + b"x"
+    )
+    assert len(first.binary) == 1
+    assert second.binary == []
+
+
+def test_application_binary_reaches_role_without_timestamp_header() -> None:
+    """An application-specific binary message reaches its role whole, however short."""
+    role = _ApplicationRole()
+    conn = _bare_connection([role], strict=True)
+    conn._route_inbound_binary(b"\xc8abc")  # noqa: SLF001
+    assert role.messages == [(200, b"abc")]
+
+
+def test_unhandled_binary_warns(caplog: Any) -> None:
+    """A binary type no role claims warns once, then reports at debug, rather than crashing."""
+    role = _RecordingRole(consume=False)
+    conn = _bare_connection([role])
+    chunk = pack_binary_header_raw(200, 1) + b"x"
+    with (
+        caplog.at_level(logging.DEBUG),
+        patch("aiosendspin.server.connection.time.monotonic", return_value=5.0),
+    ):
+        for _ in range(3):
+            conn._route_inbound_binary(chunk)  # noqa: SLF001
+        conn._last_unhandled_binary_log_s -= WARN_INTERVAL_S  # noqa: SLF001
+        conn._route_inbound_binary(chunk)  # noqa: SLF001
+    reports = [r for r in caplog.records if "unhandled binary" in r.getMessage().lower()]
+    assert [r.levelno for r in reports] == [logging.WARNING, logging.DEBUG]
+    assert "3 message(s)" in reports[1].getMessage()
+
+
+def test_server_to_client_binary_type_is_flagged() -> None:
+    """A binary type only the server sends is flagged."""
+    conn = _bare_connection([_RecordingRole()])
+    conn._route_inbound_binary(  # noqa: SLF001
+        pack_binary_header_raw(BinaryMessageType.AUDIO_CHUNK.value, 1) + b"x"
+    )
+    assert conn._client.noncompliance == [  # type: ignore[union-attr]  # noqa: SLF001
+        "sent a server-to-client binary message type"
+    ]
+
+
+@pytest.mark.parametrize("message_type", [5, 13, 22, 24, 100, 191, 200])
+def test_unimplemented_binary_type_is_ignored(message_type: int) -> None:
+    """A binary type the server does not implement is ignored, even for a strict server."""
+    role = _RecordingRole()
+    conn = _bare_connection([role], strict=True, input_open=True)
+    conn._route_inbound_binary(pack_binary_header_raw(message_type, 1) + b"x")  # noqa: SLF001
+    assert role.binary == []
+    assert conn._client.noncompliance == []  # type: ignore[union-attr]  # noqa: SLF001
+
+
+@pytest.mark.parametrize(
+    ("frame", "noncompliance"),
+    [
+        (b"\x0c\x00", ["sent a source audio chunk shorter than its header"]),
+        (b"\xc8\x00", []),
+        (b"", []),
+    ],
+)
+def test_binary_shorter_than_header_is_dropped(frame: bytes, noncompliance: list[str]) -> None:
+    """A frame shorter than the header is dropped, flagged only for a source audio chunk."""
+    role = _RecordingRole()
+    conn = _bare_connection([role], input_open=True)
+    conn._route_inbound_binary(frame)  # noqa: SLF001
+    assert role.binary == []
+    assert conn._client.noncompliance == noncompliance  # type: ignore[union-attr]  # noqa: SLF001
+
+
+async def test_client_stream_start_and_end_dispatched_to_roles() -> None:
+    """client-stream/start and client-stream/end reach role hooks via _handle_message."""
+    role = _RecordingRole()
+    conn = _bare_connection([role], starts=1)
+    await conn._handle_message(_PCM_START, timestamp_us=0)  # noqa: SLF001
+    await conn._handle_message(ClientStreamEndMessage(), timestamp_us=0)  # noqa: SLF001
+    assert len(role.starts) == 1
+    assert role.ends == 1
+
+
+# DEPRECATED(spec-pr-163): remove in aiosendspin <version>
+async def test_superseded_stream_message_names_are_dispatched_and_flagged() -> None:
+    """A source on the pre-rename wire is still served, and the deviation recorded."""
+    role = _RecordingRole()
+    conn = _bare_connection([role], starts=1)
+    start = ClientMessage.from_json(
+        '{"type":"client_stream/start","payload":{"source":'
+        '{"codec":"pcm","sample_rate":48000,"bit_depth":16,"channels":2}}}'
+    )
+    end = ClientMessage.from_json('{"type":"client_stream/end","payload":{}}')
+
+    await conn._handle_message(start, timestamp_us=0)  # noqa: SLF001
+    await conn._handle_message(end, timestamp_us=0)  # noqa: SLF001
+
+    assert len(role.starts) == 1
+    assert role.ends == 1
+    assert conn._client.noncompliance == [  # noqa: SLF001
+        "client sent client_stream/start, superseded by client-stream/start",
+        "client sent client_stream/end, superseded by client-stream/end",
+    ]
+
+
+async def test_current_stream_message_names_are_not_flagged() -> None:
+    """The current spelling raises nothing with the server."""
+    role = _RecordingRole()
+    conn = _bare_connection([role])
+
+    await conn._handle_message(ClientStreamEndMessage(), timestamp_us=0)  # noqa: SLF001
+
+    assert role.ends == 1
+    assert conn._client.noncompliance == []  # noqa: SLF001
+
+
+@pytest.mark.parametrize("strict", [False, True])
+@pytest.mark.parametrize(
+    "raw", ['{"type":"client-stream/end"}', '{"type":"client-stream/end","payload":5}']
+)
+async def test_stream_end_without_payload_object_is_flagged_before_ending(
+    raw: str, *, strict: bool
+) -> None:
+    """A client-stream/end without a payload object is flagged, then handled unless strict."""
+    role = _RecordingRole()
+    conn = _bare_connection([role], strict=strict, input_open=True)
+
+    with pytest.raises(ClientComplianceError) if strict else nullcontext():
+        await conn._handle_message(ClientMessage.from_json(raw), timestamp_us=0)  # noqa: SLF001
+
+    assert conn._client.noncompliance == ["sent a message without a payload object"]  # noqa: SLF001
+    assert role.ends == (0 if strict else 1)
+    assert conn._source_input_open is strict  # noqa: SLF001
+
+
+# DEPRECATED(spec-pr-163): remove in aiosendspin <version>
+async def test_superseded_stream_message_name_is_rejected_by_a_strict_server() -> None:
+    """The flag is not cosmetic: a strict server drops a source on the old spelling."""
+    conn = _bare_connection([_RecordingRole()], strict=True)
+
+    with pytest.raises(ClientComplianceError):
+        await conn._handle_message(  # noqa: SLF001
+            ClientMessage.from_json('{"type":"client_stream/end","payload":{}}'), timestamp_us=0
+        )
+
+
+async def test_unsolicited_stream_start_is_flagged_and_not_dispatched() -> None:
+    """A client-stream/start with no start outstanding opens nothing."""
+    role = _RecordingRole()
+    conn = _bare_connection([role])
+
+    await conn._handle_message(_PCM_START, timestamp_us=0)  # noqa: SLF001
+    conn._route_inbound_binary(_chunk())  # noqa: SLF001
+
+    assert role.starts == []
+    assert role.binary == []
+    assert conn._client.noncompliance == [  # noqa: SLF001
+        "client-stream/start sent without a preceding source start command",
+        "sent source audio without an open input stream",
+    ]
+
+
+async def test_each_start_authorizes_one_opening() -> None:
+    """A second opening after client-stream/end needs a new start and does not reopen."""
+    role = _RecordingRole()
+    conn = _bare_connection([role], starts=1)
+
+    await conn._handle_message(_PCM_START, timestamp_us=0)  # noqa: SLF001
+    await conn._handle_message(ClientStreamEndMessage(), timestamp_us=0)  # noqa: SLF001
+    await conn._handle_message(_PCM_START, timestamp_us=0)  # noqa: SLF001
+    conn._route_inbound_binary(_chunk())  # noqa: SLF001
+
+    assert len(role.starts) == 1
+    assert role.binary == []
+    assert conn._client.noncompliance == [  # noqa: SLF001
+        "client-stream/start sent without a preceding source start command",
+        "sent source audio without an open input stream",
+    ]
+
+
+async def test_stream_start_on_an_open_stream_replaces_it_without_a_start() -> None:
+    """A format replacement needs no start and leaves an outstanding start unused."""
+    role = _RecordingRole()
+    conn = _bare_connection([role], starts=2)
+
+    for _ in range(2):
+        await conn._handle_message(_PCM_START, timestamp_us=0)  # noqa: SLF001
+    await conn._handle_message(ClientStreamEndMessage(), timestamp_us=0)  # noqa: SLF001
+    await conn._handle_message(_PCM_START, timestamp_us=0)  # noqa: SLF001
+
+    assert len(role.starts) == 3
+    assert conn._client.noncompliance == []  # noqa: SLF001
+
+
+async def test_crossing_starts_each_open_a_stream() -> None:
+    """start, stop, start may cross the client's end, so two openings are both valid."""
+    role = _RecordingRole()
+    conn = _bare_connection([role])
+    conn.record_source_start()
+    conn.record_source_start()
+
+    await conn._handle_message(_PCM_START, timestamp_us=0)  # noqa: SLF001
+    await conn._handle_message(ClientStreamEndMessage(), timestamp_us=0)  # noqa: SLF001
+    await conn._handle_message(_PCM_START, timestamp_us=0)  # noqa: SLF001
+
+    assert len(role.starts) == 2
+    assert conn._client.noncompliance == []  # noqa: SLF001
+
+
+def test_source_audio_without_an_open_stream_closes_a_strict_server() -> None:
+    """Source audio outside an input stream is a protocol error the server rejects."""
+    role = _RecordingRole()
+    conn = _bare_connection([role], strict=True)
+
+    with pytest.raises(ClientComplianceError):
+        conn._route_inbound_binary(_chunk())  # noqa: SLF001
+    assert role.binary == []
+
+
+def test_source_audio_while_unavailable_is_flagged() -> None:
+    """Source audio after the client reported available: false is flagged, not decoded."""
+    role = _RecordingRole()
+    conn = _bare_connection([role], input_open=True)
+    conn._client.available = False  # type: ignore[union-attr]  # noqa: SLF001
+
+    conn._route_inbound_binary(_chunk())  # noqa: SLF001
+
+    assert role.binary == []
+    assert conn._client.noncompliance == [  # noqa: SLF001
+        "sent source audio while reporting available: false"
+    ]
+
+
+def test_source_audio_without_a_source_role_is_dropped_quietly(caplog: Any) -> None:
+    """In-flight audio on a stream still open after the role's removal is discarded."""
+    conn = _bare_connection([], input_open=True)
+
+    with caplog.at_level(logging.WARNING):
+        conn._route_inbound_binary(_chunk())  # noqa: SLF001
+
+    assert caplog.records == []
+    assert conn._client.noncompliance == []  # noqa: SLF001

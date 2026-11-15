@@ -1,0 +1,2514 @@
+"""Tests for multi-server support (connection reasons and client reclaim)."""
+
+from __future__ import annotations
+
+import asyncio
+from contextlib import suppress
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+from unittest.mock import ANY, AsyncMock, MagicMock
+
+import orjson
+import pytest
+from aiohttp import WSMessage, WSMsgType, web
+
+from aiosendspin.models.core import (
+    ClientHelloMessage,
+    ClientHelloPayload,
+    ServerActivateMessage,
+    ServerStateMessage,
+    ServerStatePayload,
+    UnpairedAccess,
+)
+from aiosendspin.models.player import ClientHelloPlayerSupport, SupportedAudioFormat
+from aiosendspin.models.types import (
+    Activity,
+    AudioCodec,
+    ConnectionReason,
+    PairAbortReason,
+    PairMethod,
+    PlaybackStateType,
+    PlayerCommand,
+    RepeatMode,
+    Roles,
+)
+from aiosendspin.noise.constants import (
+    MAX_TRANSPORT_PLAINTEXT,
+    MSG_TYPE_FRAGMENT,
+    MSG_TYPE_FRAGMENT_END,
+    MSG_TYPE_FRAGMENT_MORE,
+    MSG_TYPE_JSON_BODY,
+)
+from aiosendspin.noise.keys import generate_psk, psk_id_for
+from aiosendspin.noise.pairing import (
+    PairingAbortError,
+    PairingAttempt,
+    RemotePairingAbortError,
+)
+from aiosendspin.noise.trust_store import (
+    InMemoryServerPairingStore,
+    PskCategory,
+    ResolvedPsk,
+    ServerPairingStore,
+    TrustedUnpairedClient,
+)
+from aiosendspin.noise.wire import EncryptedWebSocket, QueuedEncryptedWebSocket
+from aiosendspin.server.client import SendspinClient
+from aiosendspin.server.clock import LoopClock
+from aiosendspin.server.compliance import ClientComplianceError
+from aiosendspin.server.connection import SendspinConnection
+from aiosendspin.server.group import SendspinGroup
+from aiosendspin.server.roles.controller.group import ControllerGroupRole
+from aiosendspin.server.roles.metadata.group import MetadataGroupRole
+from aiosendspin.server.roles.metadata.state import Metadata
+from aiosendspin.server.roles.negotiation import negotiate_roles
+from aiosendspin.server.roles.registry import ROLE_FACTORIES
+from aiosendspin.server.server import SendspinServer
+from tests.noise.conftest import FakeWebSocket, make_paired_sessions
+
+if TYPE_CHECKING:
+    from aiosendspin.models.types import ServerMessage
+    from aiosendspin.noise.session import NoiseSession
+
+
+# Hello fields every encrypted client sends, so strict-server tests isolate their deviation.
+_PAIRING_HELLO_FIELDS = {
+    "supported_pair_methods": {"pairing_psk": {}},
+    "unpaired_access": {"enabled": False},
+}
+
+
+@dataclass
+class _MockServer:
+    """Mock server for testing connection reason lookup."""
+
+    loop: asyncio.AbstractEventLoop
+    clock: LoopClock
+    id: str = "srv"
+    name: str = "server"
+    languages: tuple[str, ...] | None = None
+    allow_noncompliant_clients: bool = True
+    pairing_store: ServerPairingStore = field(default_factory=InMemoryServerPairingStore)
+    remove_client: AsyncMock = field(default_factory=AsyncMock)
+
+    _connection_reasons: dict[str, ConnectionReason] = field(default_factory=dict)
+    _client_urls: dict[str, str] = field(default_factory=dict)
+    _clients: dict[str, SendspinClient] = field(default_factory=dict)
+    _connection_tasks: dict[str, asyncio.Task[None]] = field(default_factory=dict)
+    _mdns_client_urls: dict[str, str] = field(default_factory=dict)
+
+    def is_external_player(self, client_id: str) -> bool:  # noqa: ARG002
+        return False
+
+    def on_client_first_connect(self, client_id: str) -> None:  # noqa: ARG002
+        return
+
+    def get_connection_reason(self, url: str) -> ConnectionReason:
+        return self._connection_reasons.get(url, ConnectionReason.DISCOVERY)
+
+    _consume_playback_reason = SendspinServer._consume_playback_reason  # noqa: SLF001
+
+    def register_client_url(self, client_id: str, url: str) -> None:
+        self._client_urls[client_id] = url
+
+    def get_client_url(self, client_id: str) -> str | None:
+        return self._client_urls.get(client_id)
+
+    def get_or_create_client(self, client_id: str) -> SendspinClient:
+        client = self._clients.get(client_id)
+        if client is None:
+            client = SendspinClient(self, client_id=client_id)
+            self._clients[client_id] = client
+            SendspinGroup(self, client)
+        return client
+
+    def _signal_client_connected(self, client_id: str) -> None:
+        pass
+
+    def _signal_client_disconnected(self, client_id: str, goodbye_reason: object = None) -> None:
+        pass
+
+
+class _DummyConnection:
+    receives_group_updates = True
+
+    def __init__(self) -> None:
+        self.sent_messages: list[ServerMessage] = []
+
+    async def disconnect(self, *, retry_connection: bool = True) -> None:  # noqa: ARG002
+        return
+
+    def send_message(self, message: ServerMessage) -> None:
+        self.sent_messages.append(message)
+
+    def send_role_message(self, role: str, message: ServerMessage) -> None:  # noqa: ARG002
+        self.sent_messages.append(message)
+
+    def send_binary(
+        self,
+        data: bytes,  # noqa: ARG002
+        *,
+        role: str,  # noqa: ARG002
+        timestamp_us: int,  # noqa: ARG002
+        message_type: int,  # noqa: ARG002
+        buffer_end_time_us: int | None = None,  # noqa: ARG002
+        buffer_byte_count: int | None = None,  # noqa: ARG002
+        duration_us: int | None = None,  # noqa: ARG002
+        player_audio_header: bool = False,  # noqa: ARG002
+        epoch_exempt: bool = False,  # noqa: ARG002
+    ) -> bool:
+        return True
+
+
+def _player_hello(client_id: str, *, unpaired_access: bool = False) -> ClientHelloPayload:
+    return ClientHelloPayload(
+        client_id=client_id,
+        name=client_id,
+        version=1,
+        supported_roles=[Roles.PLAYER.value],
+        unpaired_access=UnpairedAccess(enabled=unpaired_access),
+        player_support=ClientHelloPlayerSupport(
+            supported_formats=[
+                SupportedAudioFormat(
+                    codec=AudioCodec.PCM,
+                    channels=2,
+                    sample_rate=48000,
+                    bit_depth=16,
+                )
+            ],
+            buffer_capacity=100_000,
+            supported_commands=[PlayerCommand.VOLUME, PlayerCommand.MUTE],
+        ),
+    )
+
+
+def _client_hello_frame(client_id: str, *, unpaired_access: bool = False) -> WSMessage:
+    return WSMessage(
+        WSMsgType.TEXT,
+        ClientHelloMessage(
+            payload=_player_hello(client_id, unpaired_access=unpaired_access)
+        ).to_json(),
+        "",
+    )
+
+
+class _FakeTransport:
+    """Transport double: records sent frames and yields queued inbound frames."""
+
+    def __init__(self, incoming: list[WSMessage] | None = None) -> None:
+        self.sent: list[str] = []
+        self._incoming = iter(incoming or [])
+        self.closed = False
+        self.close_code: int | None = None
+
+    async def send_str(self, data: str) -> None:
+        self.sent.append(data)
+
+    async def receive(self) -> WSMessage | None:
+        return next(self._incoming, None)
+
+    def sent_payloads(self) -> list[dict]:
+        return [orjson.loads(s) for s in self.sent]
+
+
+async def _exchange_hellos_encrypted(
+    conn: SendspinConnection,
+    *,
+    client_id: str = "client-1",
+    category: PskCategory = PskCategory.LONG_TERM,
+    unpaired_access: bool = False,
+) -> _FakeTransport:
+    """Drive a non-legacy (encrypted) hello exchange and return the recording transport."""
+    psk = generate_psk()
+    conn._client_id = client_id  # noqa: SLF001
+    conn._noise_psk = ResolvedPsk(  # noqa: SLF001
+        psk_id=psk_id_for(psk), psk=psk, category=category, counterparty_id=client_id
+    )
+    fake = _FakeTransport([_client_hello_frame(client_id, unpaired_access=unpaired_access)])
+    conn._transport = fake  # type: ignore[assignment]  # noqa: SLF001
+    await conn._exchange_hellos()  # noqa: SLF001
+    return fake
+
+
+@pytest.fixture
+async def mock_server() -> _MockServer:
+    """Create a mock server with connection reason tracking."""
+    loop = asyncio.get_running_loop()
+    return _MockServer(loop=loop, clock=LoopClock(loop))
+
+
+class TestConnectionReasonLookup:
+    """Tests for connection reason lookup from server."""
+
+    def test_get_connection_reason_defaults_to_discovery(self, mock_server: _MockServer) -> None:
+        """Connection reason defaults to DISCOVERY for unknown URLs."""
+        assert mock_server.get_connection_reason("ws://unknown:1234") == ConnectionReason.DISCOVERY
+
+    def test_get_connection_reason_returns_stored_reason(self, mock_server: _MockServer) -> None:
+        """Connection reason returns the stored value for known URLs."""
+        url = "ws://192.168.1.100:8927/sendspin"
+        mock_server._connection_reasons[url] = ConnectionReason.PLAYBACK  # noqa: SLF001
+
+        assert mock_server.get_connection_reason(url) == ConnectionReason.PLAYBACK
+
+
+class TestClientUrlTracking:
+    """Tests for client URL registration and lookup."""
+
+    def test_register_and_get_client_url(self, mock_server: _MockServer) -> None:
+        """Client URL can be registered and retrieved."""
+        mock_server.register_client_url("client-1", "ws://192.168.1.50:8927/sendspin")
+
+        assert mock_server.get_client_url("client-1") == "ws://192.168.1.50:8927/sendspin"
+
+    def test_get_client_url_returns_none_for_unknown(self, mock_server: _MockServer) -> None:
+        """get_client_url returns None for unknown client IDs."""
+        assert mock_server.get_client_url("unknown-client") is None
+
+
+class TestEncryptedActivities:
+    """Tests that the encrypted hello exchange declares activities from PSK + capabilities."""
+
+    @pytest.mark.asyncio
+    async def test_long_term_idle_declares_no_activities(self, mock_server: _MockServer) -> None:
+        """An idle long-term connection declares no activities but advertises active roles."""
+        conn = SendspinConnection(mock_server, wsock_client=AsyncMock())
+        fake = await _exchange_hellos_encrypted(conn, category=PskCategory.LONG_TERM)
+
+        payloads = fake.sent_payloads()
+        assert [p["type"] for p in payloads] == ["server/hello", "server/activate"]
+        activate = payloads[1]["payload"]
+        assert activate["activities"] == []
+        # active_roles present because the connection is playback-capable.
+        assert Roles.PLAYER.value in activate["active_roles"]
+
+    @pytest.mark.asyncio
+    async def test_legacy_support_keys_logged_on_ingest(
+        self, mock_server: _MockServer, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A hello carrying unversioned support keys is admitted and logged."""
+        raw = orjson.dumps(
+            {
+                "type": "client/hello",
+                "payload": {
+                    "client_id": "client-1",
+                    "name": "client-1",
+                    "version": 1,
+                    "supported_roles": ["player@v1"],
+                    "player_support": {
+                        "supported_formats": [
+                            {"codec": "pcm", "channels": 2, "sample_rate": 48000, "bit_depth": 16}
+                        ],
+                        "buffer_capacity": 100_000,
+                        "supported_commands": [],
+                    },
+                },
+            }
+        ).decode()
+        conn = SendspinConnection(mock_server, wsock_client=AsyncMock())
+        psk = generate_psk()
+        conn._client_id = "client-1"  # noqa: SLF001
+        conn._noise_psk = ResolvedPsk(  # noqa: SLF001
+            psk_id=psk_id_for(psk),
+            psk=psk,
+            category=PskCategory.LONG_TERM,
+            counterparty_id="client-1",
+        )
+        conn._transport = _FakeTransport([WSMessage(WSMsgType.TEXT, raw, "")])  # type: ignore[assignment]  # noqa: SLF001
+
+        with caplog.at_level("INFO"):
+            assert await conn._exchange_hellos() is True  # noqa: SLF001
+        assert "unversioned support keys" in caplog.text
+
+    @staticmethod
+    def _player_hello(**support_extra: object) -> str:
+        return orjson.dumps(
+            {
+                "type": "client/hello",
+                "payload": {
+                    "name": "client-1",
+                    "supported_roles": ["player@v1"],
+                    "player@v1_support": {
+                        "supported_formats": [
+                            {"codec": "pcm", "channels": 2, "sample_rate": 48000, "bit_depth": 16}
+                        ],
+                        "buffer_capacity": 100_000,
+                        **support_extra,
+                    },
+                    **_PAIRING_HELLO_FIELDS,
+                },
+            }
+        ).decode()
+
+    @staticmethod
+    def _long_term_connection(
+        server: _MockServer,
+        raw_hello: str,
+        *,
+        request: web.Request | None = None,
+        url: str | None = None,
+    ) -> SendspinConnection:
+        if request is not None:
+            conn = SendspinConnection(server, request=request)
+        else:
+            conn = SendspinConnection(server, wsock_client=AsyncMock(), url=url)
+        psk = generate_psk()
+        conn._client_id = "client-1"  # noqa: SLF001
+        conn._noise_psk = ResolvedPsk(  # noqa: SLF001
+            psk_id=psk_id_for(psk),
+            psk=psk,
+            category=PskCategory.LONG_TERM,
+            counterparty_id="client-1",
+        )
+        conn._transport = _FakeTransport([WSMessage(WSMsgType.TEXT, raw_hello, "")])  # type: ignore[assignment]  # noqa: SLF001
+        return conn
+
+    @pytest.mark.asyncio
+    async def test_strict_server_admits_hello_without_player_commands(self) -> None:
+        """A spec-shaped player hello without supported_commands is admitted by a strict server."""
+        loop = asyncio.get_running_loop()
+        strict_server = _MockServer(
+            loop=loop, clock=LoopClock(loop), allow_noncompliant_clients=False
+        )
+        conn = self._long_term_connection(strict_server, self._player_hello())
+
+        assert await conn._exchange_hellos() is True  # noqa: SLF001
+        assert "player@v1" in conn._negotiated_roles  # noqa: SLF001
+
+    @pytest.mark.asyncio
+    async def test_strict_server_ignores_unregistered_custom_version_without_support(
+        self,
+    ) -> None:
+        """A strict server admits a hello whose only player version it does not implement."""
+        loop = asyncio.get_running_loop()
+        strict_server = _MockServer(
+            loop=loop, clock=LoopClock(loop), allow_noncompliant_clients=False
+        )
+        hello = orjson.dumps(
+            {
+                "type": "client/hello",
+                "payload": {
+                    "name": "client-1",
+                    "supported_roles": ["player@_experimental", "controller@v1"],
+                    **_PAIRING_HELLO_FIELDS,
+                },
+            }
+        ).decode()
+        conn = self._long_term_connection(strict_server, hello)
+
+        assert await conn._exchange_hellos() is True  # noqa: SLF001
+        assert conn._negotiated_roles == ["controller@v1"]  # noqa: SLF001
+
+    @pytest.mark.parametrize("dialed_first", [True, False])
+    @pytest.mark.asyncio
+    async def test_strict_server_keeps_mdns_dial_over_client_dial(
+        self,
+        dialed_first: bool,  # noqa: FBT001
+    ) -> None:
+        """A strict server keeps its mDNS dial over a connection the client opened itself."""
+        loop = asyncio.get_running_loop()
+        strict_server = _MockServer(
+            loop=loop, clock=LoopClock(loop), allow_noncompliant_clients=False
+        )
+        url = "ws://192.168.1.100:8927/sendspin"
+        strict_server._mdns_client_urls = {"client-1._sendspin._tcp.local.": url}  # noqa: SLF001
+        request = MagicMock(spec=web.Request)
+        request.remote = "192.168.1.100"
+        dialed = self._long_term_connection(strict_server, self._player_hello(), url=url)
+        incoming = self._long_term_connection(strict_server, self._player_hello(), request=request)
+        first, second = (dialed, incoming) if dialed_first else (incoming, dialed)
+
+        assert await first._exchange_hellos() is True  # noqa: SLF001
+        await second._exchange_hellos()  # noqa: SLF001
+        assert strict_server._clients["client-1"].connection is dialed  # noqa: SLF001
+
+    # DEPRECATED(spec-pr-177): remove in aiosendspin <version>
+    @pytest.mark.asyncio
+    async def test_hello_player_commands_logged_on_ingest(
+        self, mock_server: _MockServer, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A hello still declaring player supported_commands is admitted and flagged."""
+        conn = self._long_term_connection(
+            mock_server, self._player_hello(supported_commands=["volume"])
+        )
+
+        with caplog.at_level("WARNING"):
+            assert await conn._exchange_hellos() is True  # noqa: SLF001
+        assert "declared player supported_commands" in caplog.text
+        client = mock_server._clients["client-1"]  # noqa: SLF001
+        support = client.info.player_support
+        assert support is not None
+        assert support.supported_commands == [PlayerCommand.VOLUME]
+
+    # DEPRECATED(spec-pr-167): remove in aiosendspin <version>
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("support_extra", "expected"),
+        [({"supported_commands": ["volume"]}, True), ({}, False)],
+    )
+    async def test_hello_player_commands_mark_pre_spec_177_wire(
+        self, mock_server: _MockServer, support_extra: dict[str, object], *, expected: bool
+    ) -> None:
+        """Only a hello declaring player supported_commands marks the connection pre-#177."""
+        conn = self._long_term_connection(mock_server, self._player_hello(**support_extra))
+
+        assert await conn._exchange_hellos() is True  # noqa: SLF001
+        assert conn.uses_pre_spec_177_wire is expected
+
+    # DEPRECATED(spec-pr-275): remove in aiosendspin <version>
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("support_extra", "expected"),
+        [({"supported_commands": ["volume"]}, True), ({}, False)],
+    )
+    async def test_only_pre_spec_177_encrypted_hello_clears_role_state_with_null(
+        self, mock_server: _MockServer, support_extra: dict[str, object], *, expected: bool
+    ) -> None:
+        """An encrypted connection gets null role objects only after a pre-#177 hello."""
+        conn = self._long_term_connection(mock_server, self._player_hello(**support_extra))
+
+        assert await conn._exchange_hellos() is True  # noqa: SLF001
+        assert conn.clears_role_state_with_null is expected
+
+    # DEPRECATED(spec-pr-177): remove in aiosendspin <version>
+    @pytest.mark.asyncio
+    async def test_strict_server_rejects_hello_player_commands(self) -> None:
+        """When noncompliance is disallowed, a hello declaring player commands is rejected."""
+        loop = asyncio.get_running_loop()
+        strict_server = _MockServer(
+            loop=loop, clock=LoopClock(loop), allow_noncompliant_clients=False
+        )
+        conn = self._long_term_connection(strict_server, self._player_hello(supported_commands=[]))
+
+        assert await conn._exchange_hellos() is False  # noqa: SLF001
+        assert "client-1" not in strict_server._clients  # noqa: SLF001
+
+    @staticmethod
+    def _visualizer_hello(**support_extra: object) -> str:
+        return orjson.dumps(
+            {
+                "type": "client/hello",
+                "payload": {
+                    "name": "client-1",
+                    "supported_roles": ["visualizer@v1"],
+                    "visualizer@v1_support": {"buffer_capacity": 65_536, **support_extra},
+                    **_PAIRING_HELLO_FIELDS,
+                },
+            }
+        ).decode()
+
+    @pytest.mark.asyncio
+    async def test_strict_server_admits_visualizer_hello_without_stream_config(self) -> None:
+        """A visualizer hello carrying only buffer_capacity is admitted by a strict server."""
+        loop = asyncio.get_running_loop()
+        strict_server = _MockServer(
+            loop=loop, clock=LoopClock(loop), allow_noncompliant_clients=False
+        )
+        conn = self._long_term_connection(strict_server, self._visualizer_hello())
+
+        assert await conn._exchange_hellos() is True  # noqa: SLF001
+        assert "visualizer@v1" in conn._negotiated_roles  # noqa: SLF001
+
+    # DEPRECATED(spec-pr-195): remove in aiosendspin <version>
+    @pytest.mark.asyncio
+    async def test_hello_visualizer_stream_config_is_flagged(
+        self, mock_server: _MockServer, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A hello still carrying visualizer stream configuration is admitted and flagged."""
+        conn = self._long_term_connection(
+            mock_server, self._visualizer_hello(types=["loudness"], rate_max=30)
+        )
+
+        with caplog.at_level("WARNING"):
+            assert await conn._exchange_hellos() is True  # noqa: SLF001
+        assert "declared visualizer stream configuration" in caplog.text
+        support = mock_server._clients["client-1"].info.visualizer_support  # noqa: SLF001
+        assert support is not None
+        assert support.types == ["loudness"]
+
+    # DEPRECATED(spec-pr-195): remove in aiosendspin <version>
+    @pytest.mark.asyncio
+    async def test_strict_server_rejects_hello_visualizer_stream_config(self) -> None:
+        """When noncompliance is disallowed, a hello with visualizer stream config is rejected."""
+        loop = asyncio.get_running_loop()
+        strict_server = _MockServer(
+            loop=loop, clock=LoopClock(loop), allow_noncompliant_clients=False
+        )
+        conn = self._long_term_connection(strict_server, self._visualizer_hello(rate_max=30))
+
+        assert await conn._exchange_hellos() is False  # noqa: SLF001
+        assert "client-1" not in strict_server._clients  # noqa: SLF001
+
+    @pytest.mark.asyncio
+    async def test_strict_server_excludes_draft_visualizer_without_rejecting(self) -> None:
+        """Strict mode does not activate the legacy draft wire, but admits the client."""
+        loop = asyncio.get_running_loop()
+        strict_server = _MockServer(
+            loop=loop, clock=LoopClock(loop), allow_noncompliant_clients=False
+        )
+        raw = orjson.dumps(
+            {
+                "type": "client/hello",
+                "payload": {
+                    "client_id": "client-1",
+                    "name": "client-1",
+                    "version": 1,
+                    "supported_roles": ["visualizer@_draft_r1"],
+                    "visualizer@_draft_r1_support": {
+                        "buffer_capacity": 1024,
+                        "types": ["loudness"],
+                        "batch_max": 8,
+                    },
+                    **_PAIRING_HELLO_FIELDS,
+                },
+            }
+        ).decode()
+        conn = SendspinConnection(strict_server, wsock_client=AsyncMock())
+        psk = generate_psk()
+        conn._client_id = "client-1"  # noqa: SLF001
+        conn._noise_psk = ResolvedPsk(  # noqa: SLF001
+            psk_id=psk_id_for(psk),
+            psk=psk,
+            category=PskCategory.LONG_TERM,
+            counterparty_id="client-1",
+        )
+        conn._transport = _FakeTransport([WSMessage(WSMsgType.TEXT, raw, "")])  # type: ignore[assignment]  # noqa: SLF001
+
+        assert await conn._exchange_hellos() is True  # noqa: SLF001
+        assert "visualizer@_draft_r1" not in conn._negotiated_roles  # noqa: SLF001
+
+    @pytest.mark.asyncio
+    async def test_strict_server_rejects_noncompliant_hello(self) -> None:
+        """When noncompliance is disallowed, an unversioned-support-key hello is rejected."""
+        loop = asyncio.get_running_loop()
+        strict_server = _MockServer(
+            loop=loop, clock=LoopClock(loop), allow_noncompliant_clients=False
+        )
+        raw = orjson.dumps(
+            {
+                "type": "client/hello",
+                "payload": {
+                    "client_id": "client-1",
+                    "name": "client-1",
+                    "version": 1,
+                    "supported_roles": ["player@v1"],
+                    "player_support": {
+                        "supported_formats": [
+                            {"codec": "pcm", "channels": 2, "sample_rate": 48000, "bit_depth": 16}
+                        ],
+                        "buffer_capacity": 100_000,
+                        "supported_commands": [],
+                    },
+                },
+            }
+        ).decode()
+        conn = SendspinConnection(strict_server, wsock_client=AsyncMock())
+        psk = generate_psk()
+        conn._client_id = "client-1"  # noqa: SLF001
+        conn._noise_psk = ResolvedPsk(  # noqa: SLF001
+            psk_id=psk_id_for(psk),
+            psk=psk,
+            category=PskCategory.LONG_TERM,
+            counterparty_id="client-1",
+        )
+        conn._transport = _FakeTransport([WSMessage(WSMsgType.TEXT, raw, "")])  # type: ignore[assignment]  # noqa: SLF001
+
+        assert await conn._exchange_hellos() is False  # noqa: SLF001
+        assert "client-1" not in strict_server._clients  # noqa: SLF001
+
+    # DEPRECATED(spec-pr-195): remove in aiosendspin <version>
+    # DEPRECATED(spec-pr-168): remove in aiosendspin <version>
+    @staticmethod
+    def _pre_rename_artwork_hello() -> str:
+        return orjson.dumps(
+            {
+                "type": "client/hello",
+                "payload": {
+                    "client_id": "client-1",
+                    "name": "client-1",
+                    "version": 1,
+                    "supported_roles": ["artwork@v1"],
+                    "artwork@v1_support": {
+                        "channels": [
+                            {
+                                "source": "album",
+                                "format": "bmp",
+                                "media_width": 300,
+                                "media_height": 200,
+                            }
+                        ]
+                    },
+                },
+            }
+        ).decode()
+
+    @staticmethod
+    def _prime_encrypted_hello(conn: SendspinConnection, raw: str) -> None:
+        psk = generate_psk()
+        conn._client_id = "client-1"  # noqa: SLF001
+        conn._noise_psk = ResolvedPsk(  # noqa: SLF001
+            psk_id=psk_id_for(psk),
+            psk=psk,
+            category=PskCategory.LONG_TERM,
+            counterparty_id="client-1",
+        )
+        conn._transport = _FakeTransport([WSMessage(WSMsgType.TEXT, raw, "")])  # type: ignore[assignment]  # noqa: SLF001
+
+    # DEPRECATED(spec-pr-195): remove in aiosendspin <version>
+    # DEPRECATED(spec-pr-168): remove in aiosendspin <version>
+    @pytest.mark.asyncio
+    async def test_pre_rename_artwork_hello_admitted_and_logged(
+        self, mock_server: _MockServer, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A pre-rename artwork hello is admitted, with both deviations logged."""
+        conn = SendspinConnection(mock_server, wsock_client=AsyncMock())
+        self._prime_encrypted_hello(conn, self._pre_rename_artwork_hello())
+
+        with caplog.at_level("INFO"):
+            assert await conn._exchange_hellos() is True  # noqa: SLF001
+        assert "pre-rename dimension keys" in caplog.text
+        assert "'bmp' format" in caplog.text
+
+    # DEPRECATED(spec-pr-195): remove in aiosendspin <version>
+    # DEPRECATED(spec-pr-168): remove in aiosendspin <version>
+    @pytest.mark.asyncio
+    async def test_strict_server_rejects_pre_rename_artwork_hello(self) -> None:
+        """Strict mode rejects the pre-rename artwork wire instead of tolerating it."""
+        loop = asyncio.get_running_loop()
+        strict_server = _MockServer(
+            loop=loop, clock=LoopClock(loop), allow_noncompliant_clients=False
+        )
+        conn = SendspinConnection(strict_server, wsock_client=AsyncMock())
+        self._prime_encrypted_hello(conn, self._pre_rename_artwork_hello())
+
+        assert await conn._exchange_hellos() is False  # noqa: SLF001
+        assert "client-1" not in strict_server._clients  # noqa: SLF001
+
+    @staticmethod
+    def _hello_missing_player_support() -> str:
+        return orjson.dumps(
+            {
+                "type": "client/hello",
+                "payload": {
+                    "name": "client-1",
+                    "supported_roles": ["player@v1", "controller@v1"],
+                },
+            }
+        ).decode()
+
+    @pytest.mark.asyncio
+    async def test_hello_missing_support_object_is_flagged_and_role_skipped(
+        self, mock_server: _MockServer, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A role listed without its support object is flagged and not activated."""
+        conn = SendspinConnection(mock_server, wsock_client=AsyncMock())
+        self._prime_encrypted_hello(conn, self._hello_missing_player_support())
+
+        with caplog.at_level("WARNING"):
+            assert await conn._exchange_hellos() is True  # noqa: SLF001
+        assert "without their required support object, not activating: player@v1" in caplog.text
+        assert conn._negotiated_roles == ["controller@v1"]  # noqa: SLF001
+        assert "client-1" in mock_server._clients  # noqa: SLF001
+
+    @pytest.mark.asyncio
+    async def test_strict_server_rejects_hello_missing_support_object(self) -> None:
+        """Strict mode rejects a hello listing a role without its support object."""
+        loop = asyncio.get_running_loop()
+        strict_server = _MockServer(
+            loop=loop, clock=LoopClock(loop), allow_noncompliant_clients=False
+        )
+        conn = SendspinConnection(strict_server, wsock_client=AsyncMock())
+        self._prime_encrypted_hello(conn, self._hello_missing_player_support())
+
+        assert await conn._exchange_hellos() is False  # noqa: SLF001
+        assert "client-1" not in strict_server._clients  # noqa: SLF001
+
+    @staticmethod
+    def _artwork_hello(*, support: bool, player: bool = False) -> str:
+        payload: dict[str, object] = {
+            "name": "client-1",
+            "supported_roles": ["artwork@v1"],
+            **_PAIRING_HELLO_FIELDS,
+        }
+        if support:
+            payload["artwork@v1_support"] = {
+                "channels": [{"source": "album", "format": "jpeg", "width": 300, "height": 300}]
+            }
+        if player:
+            payload["supported_roles"] = ["player@v1", "artwork@v1"]
+            payload["player@v1_support"] = {
+                "supported_formats": [
+                    {"codec": "pcm", "channels": 2, "sample_rate": 48000, "bit_depth": 16}
+                ],
+                "buffer_capacity": 100_000,
+            }
+        return orjson.dumps({"type": "client/hello", "payload": payload}).decode()
+
+    @pytest.mark.asyncio
+    async def test_strict_server_admits_artwork_hello_without_support(self) -> None:
+        """An artwork@v1 hello without a support object is admitted by a strict server."""
+        loop = asyncio.get_running_loop()
+        strict_server = _MockServer(
+            loop=loop, clock=LoopClock(loop), allow_noncompliant_clients=False
+        )
+        conn = SendspinConnection(strict_server, wsock_client=AsyncMock())
+        self._prime_encrypted_hello(conn, self._artwork_hello(support=False))
+
+        assert await conn._exchange_hellos() is True  # noqa: SLF001
+        assert "artwork@v1" in conn._negotiated_roles  # noqa: SLF001
+
+    # DEPRECATED(spec-pr-195): remove in aiosendspin <version>
+    @pytest.mark.asyncio
+    async def test_artwork_support_hello_admitted_and_flagged(
+        self, mock_server: _MockServer, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A hello declaring artwork@v1_support is admitted, flagged, and keeps its channels."""
+        conn = SendspinConnection(mock_server, wsock_client=AsyncMock())
+        self._prime_encrypted_hello(conn, self._artwork_hello(support=True))
+
+        with caplog.at_level("WARNING"):
+            assert await conn._exchange_hellos() is True  # noqa: SLF001
+        assert "declared artwork@v1_support" in caplog.text
+        support = mock_server._clients["client-1"].info.artwork_support  # noqa: SLF001
+        assert support is not None
+        assert support.channels[0].width == 300
+
+    # DEPRECATED(spec-pr-195): remove in aiosendspin <version>
+    @pytest.mark.asyncio
+    async def test_artwork_support_hello_keeps_player_audio_header(
+        self, mock_server: _MockServer
+    ) -> None:
+        """An artwork@v1_support hello does not switch the player to the pre-#177 header."""
+        conn = SendspinConnection(mock_server, wsock_client=AsyncMock())
+        self._prime_encrypted_hello(conn, self._artwork_hello(support=True, player=True))
+
+        assert await conn._exchange_hellos() is True  # noqa: SLF001
+        assert conn.uses_pre_spec_177_wire is False
+
+    # DEPRECATED(spec-pr-195): remove in aiosendspin <version>
+    @pytest.mark.asyncio
+    async def test_strict_server_rejects_artwork_support_hello(self) -> None:
+        """Strict mode rejects a hello declaring artwork@v1_support."""
+        loop = asyncio.get_running_loop()
+        strict_server = _MockServer(
+            loop=loop, clock=LoopClock(loop), allow_noncompliant_clients=False
+        )
+        conn = SendspinConnection(strict_server, wsock_client=AsyncMock())
+        self._prime_encrypted_hello(conn, self._artwork_hello(support=True))
+
+        assert await conn._exchange_hellos() is False  # noqa: SLF001
+        assert "client-1" not in strict_server._clients  # noqa: SLF001
+
+    @pytest.mark.asyncio
+    async def test_message_loop_hard_rejects_on_compliance_error(
+        self, mock_server: _MockServer
+    ) -> None:
+        """A ClientComplianceError during dispatch ends the loop with no warm reconnect."""
+
+        class _ListTransport:
+            close_code = 1000
+
+            def __init__(self, msgs: list[WSMessage]) -> None:
+                self._msgs = msgs
+
+            async def receive(self) -> WSMessage:
+                if not self._msgs:
+                    return WSMessage(WSMsgType.CLOSED, None, None)
+                return self._msgs.pop(0)
+
+        conn = SendspinConnection(mock_server, wsock_client=AsyncMock())
+        text = orjson.dumps({"type": "client/time", "payload": {"client_transmitted": 1}}).decode()
+        conn._transport = _ListTransport([WSMessage(WSMsgType.TEXT, text, "")])  # type: ignore[assignment]  # noqa: SLF001
+        conn._handle_message = AsyncMock(side_effect=ClientComplianceError("bad"))  # type: ignore[method-assign]  # noqa: SLF001
+        conn.disconnect = AsyncMock()  # type: ignore[method-assign]
+
+        await conn._run_message_loop()  # noqa: SLF001
+        # Cleanup must tear the connection down without a warm reconnect.
+        await conn._cleanup_connection()  # noqa: SLF001
+        conn.disconnect.assert_awaited_once_with(retry_connection=False)
+
+    @pytest.mark.asyncio
+    async def test_client_binary_frame_is_ignored_not_rejected(self) -> None:
+        """A client binary frame is logged and skipped, never rejecting the connection."""
+
+        class _ListTransport:
+            close_code = 1000
+
+            def __init__(self, msgs: list[WSMessage]) -> None:
+                self._msgs = msgs
+
+            async def receive(self) -> WSMessage:
+                if not self._msgs:
+                    return WSMessage(WSMsgType.CLOSED, None, None)
+                return self._msgs.pop(0)
+
+        loop = asyncio.get_running_loop()
+        strict_server = _MockServer(
+            loop=loop, clock=LoopClock(loop), allow_noncompliant_clients=False
+        )
+        conn = SendspinConnection(strict_server, wsock_client=AsyncMock())
+        conn._transport = _ListTransport([WSMessage(WSMsgType.BINARY, b"\x00", "")])  # type: ignore[assignment]  # noqa: SLF001
+
+        await conn._run_message_loop()  # noqa: SLF001
+        assert conn._closing is False  # noqa: SLF001
+
+    @pytest.mark.asyncio
+    async def test_unencrypted_hello_without_version_is_flagged(
+        self, mock_server: _MockServer, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An unencrypted hello that omits the required version is admitted and flagged."""
+        conn = SendspinConnection(mock_server, wsock_client=AsyncMock())  # no PSK => unencrypted
+        raw = orjson.dumps(
+            {
+                "type": "client/hello",
+                "payload": {
+                    "client_id": "legacy-1",
+                    "name": "legacy-1",
+                    "supported_roles": [],
+                },
+            }
+        ).decode()
+        with caplog.at_level("INFO"):
+            assert await conn._ingest_client_hello(raw) is True  # noqa: SLF001
+        assert "omitted required version" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_encrypted_hello_ignores_version(self, mock_server: _MockServer) -> None:
+        """An encrypted hello carrying a non-integer version field is still admitted."""
+        conn = SendspinConnection(mock_server, wsock_client=AsyncMock())
+        hello = orjson.loads(_client_hello_frame("client-1").data)
+        hello["payload"]["version"] = "x"
+        self._prime_encrypted_hello(conn, orjson.dumps(hello).decode())
+
+        assert await conn._exchange_hellos() is True  # noqa: SLF001
+
+    @pytest.mark.asyncio
+    async def test_encrypted_hello_ignores_client_id(self, mock_server: _MockServer) -> None:
+        """An encrypted hello's client_id is not kept alongside the handshake identity."""
+        conn = SendspinConnection(mock_server, wsock_client=AsyncMock())
+        hello = orjson.loads(_client_hello_frame("client-1").data)
+        hello["payload"]["client_id"] = "other"
+        self._prime_encrypted_hello(conn, orjson.dumps(hello).decode())
+
+        assert await conn._exchange_hellos() is True  # noqa: SLF001
+        assert conn._client_info is not None  # noqa: SLF001
+        assert conn._client_info.client_id is None  # noqa: SLF001
+
+    @pytest.mark.asyncio
+    async def test_dialed_for_playback_declares_playback(self, mock_server: _MockServer) -> None:
+        """A connection dialed for playback declares the playback activity up front."""
+        url = "ws://192.168.1.100:8927/sendspin"
+        mock_server._connection_reasons[url] = ConnectionReason.PLAYBACK  # noqa: SLF001
+        conn = SendspinConnection(mock_server, wsock_client=AsyncMock(), url=url)
+        fake = await _exchange_hellos_encrypted(conn, category=PskCategory.LONG_TERM)
+
+        activate = fake.sent_payloads()[1]["payload"]
+        assert activate["activities"] == [Activity.PLAYBACK.value]
+        assert Roles.PLAYER.value in activate["active_roles"]
+
+    @pytest.mark.asyncio
+    async def test_reconnect_after_playback_dial_declares_no_playback(
+        self, mock_server: _MockServer
+    ) -> None:
+        """A playback dial seeds only its own connection, not later reconnects of the URL."""
+        url = "ws://192.168.1.100:8927/sendspin"
+        mock_server._connection_reasons[url] = ConnectionReason.PLAYBACK  # noqa: SLF001
+        first = SendspinConnection(mock_server, wsock_client=AsyncMock(), url=url)
+        await _exchange_hellos_encrypted(first, category=PskCategory.LONG_TERM)
+
+        reconnect = SendspinConnection(mock_server, wsock_client=AsyncMock(), url=url)
+        fake = await _exchange_hellos_encrypted(reconnect, category=PskCategory.LONG_TERM)
+
+        assert fake.sent_payloads()[1]["payload"]["activities"] == []
+
+    @pytest.mark.asyncio
+    async def test_playback_state_change_resends_activate(self, mock_server: _MockServer) -> None:
+        """A group playback-state change re-sends server/activate (active_roles omitted)."""
+        conn = SendspinConnection(mock_server, wsock_client=AsyncMock())
+        await _exchange_hellos_encrypted(conn, category=PskCategory.LONG_TERM)
+        conn._subscribe_activity_events()  # noqa: SLF001
+        assert conn._client is not None  # noqa: SLF001
+
+        # Idle → playing: a fresh server/activate with [playback] is enqueued.
+        conn._client.group._set_playback_state(PlaybackStateType.PLAYING)  # noqa: SLF001
+        activates = [m for m in conn._priority_messages if isinstance(m, ServerActivateMessage)]  # noqa: SLF001
+        assert activates, "expected a re-sent server/activate"
+        assert activates[-1].payload.activities == [Activity.PLAYBACK]
+        assert activates[-1].payload.active_roles is None  # sticky: omitted on re-send
+
+        # Playing → stopped: re-sent with an empty activity set.
+        conn._client.group._set_playback_state(PlaybackStateType.STOPPED)  # noqa: SLF001
+        activates = [m for m in conn._priority_messages if isinstance(m, ServerActivateMessage)]  # noqa: SLF001
+        assert activates[-1].payload.activities == []
+
+    @pytest.mark.asyncio
+    async def test_sentinel_untrusted_declares_no_roles(self, mock_server: _MockServer) -> None:
+        """A Sentinel client the server hasn't trusted activates no roles."""
+        conn = SendspinConnection(mock_server, wsock_client=AsyncMock())
+        fake = await _exchange_hellos_encrypted(
+            conn, category=PskCategory.SENTINEL, unpaired_access=True
+        )
+
+        activate = fake.sent_payloads()[1]["payload"]
+        assert activate["activities"] == []
+        # active_roles is empty (no active roles) when not playback-capable; absent would
+        # mean "unchanged" (sticky).
+        assert activate["active_roles"] == []
+
+    @pytest.mark.asyncio
+    async def test_sentinel_trusted_activates_roles(self, mock_server: _MockServer) -> None:
+        """A trusted Sentinel client that admits unpaired access gets its roles provisioned."""
+        await mock_server.pairing_store.add_trusted_unpaired(
+            TrustedUnpairedClient(client_id="client-1")
+        )
+        conn = SendspinConnection(mock_server, wsock_client=AsyncMock())
+        fake = await _exchange_hellos_encrypted(
+            conn, category=PskCategory.SENTINEL, unpaired_access=True
+        )
+
+        activate = fake.sent_payloads()[1]["payload"]
+        # Idle (no playback yet) so no activity declared, but roles are provisioned.
+        assert activate["activities"] == []
+        assert activate["active_roles"] == [Roles.PLAYER.value]
+
+    @pytest.mark.asyncio
+    async def test_sentinel_trusted_but_client_disables_unpaired(
+        self, mock_server: _MockServer
+    ) -> None:
+        """A trusted client that itself refuses unpaired access gets no roles."""
+        await mock_server.pairing_store.add_trusted_unpaired(
+            TrustedUnpairedClient(client_id="client-1")
+        )
+        conn = SendspinConnection(mock_server, wsock_client=AsyncMock())
+        fake = await _exchange_hellos_encrypted(
+            conn, category=PskCategory.SENTINEL, unpaired_access=False
+        )
+
+        activate = fake.sent_payloads()[1]["payload"]
+        assert activate["active_roles"] == []
+
+
+class TestServerHelloSourceSupport:
+    """Tests that server/hello advertises the codecs a source may stream up."""
+
+    @pytest.mark.asyncio
+    async def test_hello_lists_opus_when_available(
+        self, mock_server: _MockServer, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Opus joins the mandatory codecs when PyAV can decode it."""
+        monkeypatch.setattr("aiosendspin.server.roles.source.v1.opus_available", lambda: True)
+        conn = SendspinConnection(mock_server, wsock_client=AsyncMock())
+
+        fake = await _exchange_hellos_encrypted(conn, category=PskCategory.LONG_TERM)
+
+        hello = fake.sent_payloads()[0]["payload"]
+        assert hello["source@v1_support"]["supported_codecs"] == ["flac", "pcm", "opus"]
+
+    @pytest.mark.asyncio
+    async def test_hello_lists_mandatory_codecs_without_opus(
+        self, mock_server: _MockServer, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Without libopus the server still guarantees flac and pcm."""
+        monkeypatch.setattr("aiosendspin.server.roles.source.v1.opus_available", lambda: False)
+        conn = SendspinConnection(mock_server, wsock_client=AsyncMock())
+
+        fake = await _exchange_hellos_encrypted(conn, category=PskCategory.LONG_TERM)
+
+        hello = fake.sent_payloads()[0]["payload"]
+        assert hello["source@v1_support"]["supported_codecs"] == ["flac", "pcm"]
+
+    @pytest.mark.asyncio
+    async def test_hello_omits_support_without_source_role(
+        self, mock_server: _MockServer, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A server that does not offer source@v1 sends no support object."""
+        monkeypatch.delitem(ROLE_FACTORIES, Roles.SOURCE.value)
+        conn = SendspinConnection(mock_server, wsock_client=AsyncMock())
+
+        fake = await _exchange_hellos_encrypted(conn, category=PskCategory.LONG_TERM)
+
+        assert "source@v1_support" not in fake.sent_payloads()[0]["payload"]
+
+
+class TestLegacyServerHello:
+    """Tests for the legacy (transition-mode) server/hello path."""
+
+    @pytest.mark.asyncio
+    async def test_legacy_hello_carries_connection_reason(self, mock_server: _MockServer) -> None:
+        """A legacy (unencrypted) hello exchange uses connection_reason, no server/activate."""
+        url = "ws://192.168.1.100:8927/sendspin"
+        mock_server._connection_reasons[url] = ConnectionReason.PLAYBACK  # noqa: SLF001
+        conn = SendspinConnection(mock_server, wsock_client=AsyncMock(), url=url)
+
+        fake = _FakeTransport()
+        conn._transport = fake  # type: ignore[assignment]  # noqa: SLF001
+        # Legacy connections peek client/hello before the transport is encrypted.
+        conn._pending_first_text = ClientHelloMessage(  # noqa: SLF001
+            payload=_player_hello("client-1")
+        ).to_json()
+        await conn._exchange_hellos()  # noqa: SLF001
+
+        payloads = fake.sent_payloads()
+        assert [p["type"] for p in payloads] == ["server/hello"]
+        assert payloads[0]["payload"]["connection_reason"] == ConnectionReason.PLAYBACK.value
+
+    @pytest.mark.asyncio
+    async def test_legacy_reconnect_after_playback_dial_sends_discovery(
+        self, mock_server: _MockServer
+    ) -> None:
+        """A legacy reconnect of a URL dialed for playback no longer claims playback."""
+        url = "ws://192.168.1.100:8927/sendspin"
+        mock_server._connection_reasons[url] = ConnectionReason.PLAYBACK  # noqa: SLF001
+        reasons = []
+        for _ in range(2):
+            conn = SendspinConnection(mock_server, wsock_client=AsyncMock(), url=url)
+            fake = _FakeTransport()
+            conn._transport = fake  # type: ignore[assignment]  # noqa: SLF001
+            conn._pending_first_text = ClientHelloMessage(  # noqa: SLF001
+                payload=_player_hello("client-1")
+            ).to_json()
+            await conn._exchange_hellos()  # noqa: SLF001
+            reasons.append(fake.sent_payloads()[0]["payload"]["connection_reason"])
+
+        assert reasons == [ConnectionReason.PLAYBACK.value, ConnectionReason.DISCOVERY.value]
+
+    # DEPRECATED(spec-pr-183): remove in aiosendspin <version>
+    @pytest.mark.asyncio
+    async def test_management_dial_reason_seeds_management(self, mock_server: _MockServer) -> None:
+        """A connection dialed for management starts with the management activity enabled."""
+        url = "ws://192.168.1.100:8927/sendspin"
+        mock_server._connection_reasons[url] = ConnectionReason.MANAGEMENT  # noqa: SLF001
+        conn = SendspinConnection(mock_server, wsock_client=AsyncMock(), url=url)
+
+        assert conn._management_active is True  # noqa: SLF001
+
+    # DEPRECATED(spec-pr-183): remove in aiosendspin <version>
+    @pytest.mark.asyncio
+    async def test_legacy_hello_clamps_post_legacy_reasons(self, mock_server: _MockServer) -> None:
+        """Reasons legacy clients cannot parse are sent as discovery."""
+        url = "ws://192.168.1.100:8927/sendspin"
+        mock_server._connection_reasons[url] = ConnectionReason.MANAGEMENT  # noqa: SLF001
+        conn = SendspinConnection(mock_server, wsock_client=AsyncMock(), url=url)
+
+        fake = _FakeTransport()
+        conn._transport = fake  # type: ignore[assignment]  # noqa: SLF001
+        conn._pending_first_text = ClientHelloMessage(  # noqa: SLF001
+            payload=_player_hello("client-1")
+        ).to_json()
+        await conn._exchange_hellos()  # noqa: SLF001
+
+        reason = fake.sent_payloads()[0]["payload"]["connection_reason"]
+        assert reason == ConnectionReason.DISCOVERY.value
+
+    # DEPRECATED(spec-pr-167): remove in aiosendspin <version>
+    @pytest.mark.asyncio
+    async def test_legacy_hello_speaks_pre_spec_177_wire(self, mock_server: _MockServer) -> None:
+        """An unencrypted connection speaks the pre-#177 wire."""
+        conn = SendspinConnection(mock_server, wsock_client=AsyncMock())
+        conn._transport = _FakeTransport()  # type: ignore[assignment]  # noqa: SLF001
+        hello = _player_hello("client-1")
+        assert hello.player_support is not None
+        hello.player_support.supported_commands = None
+        conn._pending_first_text = ClientHelloMessage(payload=hello).to_json()  # noqa: SLF001
+        await conn._exchange_hellos()  # noqa: SLF001
+
+        assert conn.uses_pre_spec_177_wire is True
+
+    # DEPRECATED(spec-pr-175): remove in aiosendspin <version>
+    @pytest.mark.asyncio
+    async def test_legacy_hello_gets_metadata_clear_as_null_fields(
+        self, mock_server: _MockServer
+    ) -> None:
+        """An unencrypted connection gets a metadata clear with every field set to null."""
+        conn = SendspinConnection(mock_server, wsock_client=AsyncMock())
+        fake = _FakeTransport()
+        conn._transport = fake  # type: ignore[assignment]  # noqa: SLF001
+        hello = _player_hello("client-1")
+        hello.supported_roles = [Roles.PLAYER.value, Roles.METADATA.value]
+        assert hello.player_support is not None
+        hello.player_support.supported_commands = None
+        conn._pending_first_text = ClientHelloMessage(payload=hello).to_json()  # noqa: SLF001
+        await conn._exchange_hellos()  # noqa: SLF001
+        client = conn._client  # noqa: SLF001
+        assert client is not None
+        metadata = client.group.group_role("metadata")
+        assert isinstance(metadata, MetadataGroupRole)
+
+        metadata.set_metadata(Metadata(title="Song"))
+        metadata.clear()
+        writer = asyncio.create_task(conn._writer())  # noqa: SLF001
+        await conn._writer_idle.wait()  # noqa: SLF001
+        writer.cancel()
+        with suppress(asyncio.CancelledError):
+            await writer
+
+        assert fake.sent_payloads()[-1]["payload"] == {
+            "metadata": {
+                "timestamp": ANY,
+                "title": None,
+                "artist": None,
+                "album_artist": None,
+                "album": None,
+                "artwork_url": None,
+                "year": None,
+                "track": None,
+                "progress": None,
+                "repeat": "off",
+                "shuffle": False,
+            }
+        }
+
+    # DEPRECATED(spec-pr-81): remove in aiosendspin <version>
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("encrypted", [False, True], ids=["legacy", "current"])
+    async def test_only_legacy_hello_gets_repeat_shuffle_in_metadata(
+        self, mock_server: _MockServer, *, encrypted: bool
+    ) -> None:
+        """Only a legacy connection gets repeat and shuffle in the metadata object."""
+        conn = SendspinConnection(mock_server, wsock_client=AsyncMock())
+        hello = _player_hello("client-1")
+        hello.supported_roles = [Roles.PLAYER.value, Roles.METADATA.value]
+        assert hello.player_support is not None
+        hello.player_support.supported_commands = None
+        hello_text = ClientHelloMessage(payload=hello).to_json()
+        if encrypted:
+            psk = generate_psk()
+            conn._client_id = "client-1"  # noqa: SLF001
+            conn._noise_psk = ResolvedPsk(  # noqa: SLF001
+                psk_id=psk_id_for(psk), psk=psk, category=PskCategory.LONG_TERM
+            )
+            fake = _FakeTransport([WSMessage(WSMsgType.TEXT, hello_text, "")])
+        else:
+            fake = _FakeTransport()
+            conn._pending_first_text = hello_text  # noqa: SLF001
+        conn._transport = fake  # type: ignore[assignment]  # noqa: SLF001
+        await conn._exchange_hellos()  # noqa: SLF001
+        client = conn._client  # noqa: SLF001
+        assert client is not None
+        controller = client.group.group_role("controller")
+        assert isinstance(controller, ControllerGroupRole)
+
+        writer = asyncio.create_task(conn._writer())  # noqa: SLF001
+        await conn._writer_idle.wait()  # noqa: SLF001
+        controller.set_repeat(RepeatMode.ALL)
+        controller.set_shuffle(True)
+        await conn._writer_idle.wait()  # noqa: SLF001
+        writer.cancel()
+        with suppress(asyncio.CancelledError):
+            await writer
+
+        metadata = [
+            p["payload"]["metadata"]
+            for p in fake.sent_payloads()
+            if p["type"] == "server/state" and "metadata" in p["payload"]
+        ]
+        assert metadata
+        if encrypted:
+            assert all("repeat" not in m and "shuffle" not in m for m in metadata)
+        else:
+            assert metadata[-1]["repeat"] == "all"
+            assert metadata[-1]["shuffle"] is True
+
+
+class _FakePairingTransport(_FakeTransport, EncryptedWebSocket):
+    """A recording transport that satisfies the encrypted-transport check in pairing."""
+
+    # Shadow the EncryptedWebSocket properties so _FakeTransport.__init__ can assign them.
+    closed = False
+    close_code: int | None = None
+
+    def __init__(self, incoming: list[WSMessage] | None = None) -> None:
+        _FakeTransport.__init__(self, incoming)
+
+
+class TestInitialConnectPairingAbort:
+    """Aborted initial-connect pairing follows the spec's closing/non-closing split."""
+
+    @staticmethod
+    def _pairing_connection(
+        mock_server: _MockServer, reason: PairAbortReason
+    ) -> tuple[SendspinConnection, _FakePairingTransport]:
+        conn = SendspinConnection(mock_server, wsock_client=AsyncMock())
+        psk = generate_psk()
+        conn._client_id = "client-1"  # noqa: SLF001
+        conn._noise_psk = ResolvedPsk(  # noqa: SLF001
+            psk_id=psk_id_for(psk), psk=psk, category=PskCategory.PAIRING
+        )
+        fake = _FakePairingTransport([_client_hello_frame("client-1")])
+        conn._transport = fake  # noqa: SLF001
+        conn._pair_on_connect = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+            side_effect=RemotePairingAbortError(reason)
+        )
+        return conn, fake
+
+    @pytest.mark.asyncio
+    async def test_nonclosing_abort_keeps_connection(self, mock_server: _MockServer) -> None:
+        """A non-closing abort reason ends pairing with a leave activate, not a teardown."""
+        conn, fake = self._pairing_connection(mock_server, PairAbortReason.ATTEMPT_TIMEOUT)
+
+        assert await conn._exchange_hellos() is True  # noqa: SLF001
+
+        payloads = fake.sent_payloads()
+        assert payloads[-1]["type"] == "server/activate"
+        assert Activity.PAIRING.value not in payloads[-1]["payload"]["activities"]
+
+    @pytest.mark.asyncio
+    async def test_closing_abort_propagates(self, mock_server: _MockServer) -> None:
+        """A closing abort reason still tears the connection down."""
+        conn, _ = self._pairing_connection(mock_server, PairAbortReason.CONCURRENT_ATTEMPT)
+
+        with pytest.raises(PairingAbortError):
+            await conn._exchange_hellos()  # noqa: SLF001
+
+
+class TestMidConnectionPairingAbort:
+    """Pair aborts during a mid-connection pairing attempt."""
+
+    @pytest.mark.asyncio
+    async def test_closing_abort_closes_connection(self, mock_server: _MockServer) -> None:
+        """A closing abort reason closes the connection even if the client keeps it open."""
+        conn = SendspinConnection(mock_server, wsock_client=AsyncMock())
+        conn._client_id = "client-1"  # noqa: SLF001
+        conn._client_info = ClientHelloPayload.from_dict(  # noqa: SLF001
+            {"name": "client-1", "supported_roles": [], **_PAIRING_HELLO_FIELDS}
+        )
+        transport = _FakePairingTransport()
+        raw = AsyncMock()
+        transport._ws = raw  # noqa: SLF001
+        transport._session = make_paired_sessions()[1]  # noqa: SLF001
+        conn._transport = transport  # noqa: SLF001
+        conn._pair = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+            side_effect=RemotePairingAbortError(PairAbortReason.CONCURRENT_ATTEMPT)
+        )
+
+        with pytest.raises(RemotePairingAbortError):
+            await conn.initiate_pairing(
+                PairingAttempt(
+                    method=PairMethod.PAIRING_PSK, pairing_psk=generate_psk(), client_id="client-1"
+                )
+            )
+
+        raw.close.assert_awaited_once()
+
+
+# DEPRECATED(spec-pr-172): remove in aiosendspin <version>
+class TestLegacyFragmentTolerance:
+    """Legacy fragment IDs 2/3 are tolerated on receive and sent only to pre-#177 clients."""
+
+    @staticmethod
+    def _hello_text(*, pre_spec_177: bool) -> str:
+        support: dict[str, object] = {
+            "supported_formats": [
+                {"codec": "pcm", "channels": 2, "sample_rate": 48000, "bit_depth": 16}
+            ],
+            "buffer_capacity": 100_000,
+        }
+        if pre_spec_177:
+            support["supported_commands"] = ["volume"]
+        return orjson.dumps(
+            {
+                "type": "client/hello",
+                "payload": {
+                    "name": "client-1",
+                    "supported_roles": ["player@v1"],
+                    "player@v1_support": support,
+                    **_PAIRING_HELLO_FIELDS,
+                },
+            }
+        ).decode()
+
+    @staticmethod
+    def _trust_level_controller_hello_text() -> str:
+        return orjson.dumps(
+            {
+                "type": "client/hello",
+                "payload": {
+                    "name": "client-1",
+                    "supported_roles": ["controller@v1"],
+                    "trust_level": "user",
+                },
+            }
+        ).decode()
+
+    @staticmethod
+    async def _encrypted_connection(
+        server: _MockServer,
+    ) -> tuple[SendspinConnection, EncryptedWebSocket, FakeWebSocket, NoiseSession]:
+        """Return a connection whose transport is installed as after a Noise handshake.
+
+        The returned session is the client's, for encrypting inbound frames.
+        """
+        server_session, client_session = make_paired_sessions()
+        raw = FakeWebSocket()
+        transport = EncryptedWebSocket(raw, server_session)
+        conn = SendspinConnection(server, wsock_client=AsyncMock())
+        psk = generate_psk()
+        conn._client_id = "client-1"  # noqa: SLF001
+        conn._noise_psk = ResolvedPsk(  # noqa: SLF001
+            psk_id=psk_id_for(psk), psk=psk, category=PskCategory.LONG_TERM
+        )
+        conn._establish_transport = AsyncMock(return_value=transport)  # type: ignore[method-assign]  # noqa: SLF001
+        await conn._setup_connection()  # noqa: SLF001
+        return conn, transport, raw, client_session
+
+    @staticmethod
+    async def _push(raw: FakeWebSocket, session: NoiseSession, plaintexts: list[bytes]) -> None:
+        for plaintext in plaintexts:
+            await raw.push(WSMessage(WSMsgType.BINARY, session.encrypt(plaintext), ""))
+
+    @staticmethod
+    def _legacy_hello_frames(text: str) -> list[bytes]:
+        """Split a client/hello across legacy 2/3 fragment frames."""
+        body = text.encode()
+        return [
+            bytes([MSG_TYPE_FRAGMENT_MORE, MSG_TYPE_JSON_BODY]) + body[:10],
+            bytes([MSG_TYPE_FRAGMENT_END]) + body[10:],
+        ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("hello", "pre_spec_177"),
+        [
+            (_hello_text(pre_spec_177=True), True),
+            (_trust_level_controller_hello_text(), True),
+            (_hello_text(pre_spec_177=False), False),
+        ],
+        ids=["player-supported-commands", "trust-level-controller", "current"],
+    )
+    async def test_legacy_send_framing_follows_pre_spec_177_hello(
+        self, mock_server: _MockServer, hello: str, *, pre_spec_177: bool
+    ) -> None:
+        """Only a pre-#177 hello switches the transport to legacy fragment framing."""
+        conn, transport, raw, client_session = await self._encrypted_connection(mock_server)
+        await self._push(raw, client_session, [bytes([MSG_TYPE_JSON_BODY]) + hello.encode()])
+
+        assert await conn._exchange_hellos() is True  # noqa: SLF001
+        assert conn.uses_pre_spec_177_wire is pre_spec_177
+        assert transport.legacy_fragment_framing is pre_spec_177
+
+        await transport.send_bytes(b"\x08" + b"a" * MAX_TRANSPORT_PLAINTEXT)
+        frames = [client_session.decrypt(ct) for ct in raw.sent]  # type: ignore[arg-type]
+        expected = (
+            [MSG_TYPE_FRAGMENT_MORE, MSG_TYPE_FRAGMENT_END]
+            if pre_spec_177
+            else [MSG_TYPE_FRAGMENT, MSG_TYPE_FRAGMENT]
+        )
+        assert [f[0] for f in frames[-2:]] == expected
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("legacy", [True, False])
+    async def test_queued_transport_keeps_send_framing(self, *, legacy: bool) -> None:
+        """The pairing transport sends with the same fragment framing as its base."""
+        server_session, client_session = make_paired_sessions()
+        raw = FakeWebSocket()
+        base = EncryptedWebSocket(raw, server_session)
+        base.legacy_fragment_framing = legacy
+
+        queued = QueuedEncryptedWebSocket(base, asyncio.Queue())
+        await queued.send_bytes(b"\x08" + b"a" * MAX_TRANSPORT_PLAINTEXT)
+
+        expected = MSG_TYPE_FRAGMENT_MORE if legacy else MSG_TYPE_FRAGMENT
+        assert client_session.decrypt(raw.sent[0])[0] == expected
+
+    @pytest.mark.asyncio
+    async def test_legacy_fragment_in_hello_is_flagged_when_lenient(
+        self, mock_server: _MockServer, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A lenient server reassembles a legacy-fragmented hello and flags it."""
+        conn, _, raw, client_session = await self._encrypted_connection(mock_server)
+        hello = self._hello_text(pre_spec_177=False)
+        await self._push(raw, client_session, self._legacy_hello_frames(hello))
+
+        with caplog.at_level("WARNING"):
+            assert await conn._exchange_hellos() is True  # noqa: SLF001
+        assert "fragment used legacy binary message IDs 2/3" in caplog.text
+        assert "client-1" in mock_server._clients  # noqa: SLF001
+
+    @pytest.mark.asyncio
+    async def test_legacy_fragment_in_hello_closes_when_strict(self) -> None:
+        """A strict server closes a connection whose hello uses legacy fragments."""
+        loop = asyncio.get_running_loop()
+        strict_server = _MockServer(
+            loop=loop, clock=LoopClock(loop), allow_noncompliant_clients=False
+        )
+        conn, _, raw, client_session = await self._encrypted_connection(strict_server)
+        hello = self._hello_text(pre_spec_177=False)
+        await self._push(raw, client_session, self._legacy_hello_frames(hello))
+
+        await conn.handle_client()
+
+        assert conn._closing is True  # noqa: SLF001
+        assert conn.should_retry_server_initiated_connection is False
+        assert "client-1" not in strict_server._clients  # noqa: SLF001
+
+    @pytest.mark.asyncio
+    async def test_legacy_fragment_after_hello_is_flagged_when_lenient(
+        self, mock_server: _MockServer, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A lenient message loop reassembles a legacy fragment and keeps the connection."""
+        conn, _, raw, client_session = await self._encrypted_connection(mock_server)
+        hello = self._hello_text(pre_spec_177=False).encode()
+        await self._push(raw, client_session, [bytes([MSG_TYPE_JSON_BODY]) + hello])
+        assert await conn._exchange_hellos() is True  # noqa: SLF001
+        routed: list[bytes] = []
+        conn._route_inbound_binary = routed.append  # type: ignore[method-assign]  # noqa: SLF001
+
+        await self._push(
+            raw,
+            client_session,
+            [
+                bytes([MSG_TYPE_FRAGMENT_MORE, 0x08]) + b"ab",
+                bytes([MSG_TYPE_FRAGMENT_END]) + b"cd",
+                bytes([MSG_TYPE_FRAGMENT_MORE, 0x08]) + b"ef",
+                bytes([MSG_TYPE_FRAGMENT_END]) + b"gh",
+            ],
+        )
+        await raw.push(None)
+        with caplog.at_level("WARNING"):
+            await conn._run_message_loop()  # noqa: SLF001
+
+        assert routed == [b"\x08abcd", b"\x08efgh"]
+        assert caplog.text.count("fragment used legacy binary message IDs 2/3") == 1
+        assert conn._closing is False  # noqa: SLF001
+
+    @pytest.mark.asyncio
+    async def test_legacy_fragment_after_hello_closes_when_strict(self) -> None:
+        """A strict server's message loop closes on a legacy fragment."""
+        loop = asyncio.get_running_loop()
+        strict_server = _MockServer(
+            loop=loop, clock=LoopClock(loop), allow_noncompliant_clients=False
+        )
+        conn, _, raw, client_session = await self._encrypted_connection(strict_server)
+        hello = self._hello_text(pre_spec_177=False).encode()
+        await self._push(raw, client_session, [bytes([MSG_TYPE_JSON_BODY]) + hello])
+        assert await conn._exchange_hellos() is True  # noqa: SLF001
+
+        await self._push(raw, client_session, [bytes([MSG_TYPE_FRAGMENT_MORE, 0x08]) + b"a"])
+        await raw.push(None)
+        await conn._run_message_loop()  # noqa: SLF001
+
+        assert conn._closing is True  # noqa: SLF001
+
+
+class TestHandshakeOrdering:
+    """Tests for server/hello ordering relative to role messages."""
+
+    @pytest.mark.asyncio
+    async def test_no_role_messages_sent_before_server_activate(
+        self, mock_server: _MockServer, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Role messages enqueued during attach must not be sent until after the hello exchange.
+
+        The writer only starts after server/activate, so a role message enqueued
+        while attaching the client cannot land on the wire before the hello-exchange frames.
+        """
+        conn = SendspinConnection(mock_server, wsock_client=AsyncMock())
+
+        original_attach_connection = SendspinClient.attach_connection
+
+        def attach_with_early_role_message(
+            self: SendspinClient,
+            connection: SendspinConnection,
+            *,
+            client_info: ClientHelloPayload,
+            active_roles: list[str],
+            negotiated_roles: list[str] | None = None,
+        ) -> None:
+            connection.send_role_message(
+                "metadata",
+                ServerStateMessage(payload=ServerStatePayload()),
+            )
+            original_attach_connection(
+                self,
+                connection,
+                client_info=client_info,
+                active_roles=active_roles,
+                negotiated_roles=negotiated_roles,
+            )
+
+        monkeypatch.setattr(SendspinClient, "attach_connection", attach_with_early_role_message)
+
+        fake = await _exchange_hellos_encrypted(conn)
+
+        # Only the hello-exchange frames reach the wire; the role message stays queued.
+        assert [p["type"] for p in fake.sent_payloads()] == ["server/hello", "server/activate"]
+
+
+class TestCustomRoleSupportParsing:
+    """Tests for custom role support-key handling in inbound client/hello messages."""
+
+    @pytest.mark.parametrize(
+        ("role_id", "support_key", "expected_attr", "support_payload"),
+        [
+            (
+                "player@_custom_version",
+                "player@_custom_version_support",
+                "player_support",
+                {
+                    "supported_formats": [
+                        {"codec": "pcm", "sample_rate": 48000, "bit_depth": 16, "channels": 2}
+                    ],
+                    "buffer_capacity": 100_000,
+                    "supported_commands": [],
+                },
+            ),
+            (
+                "artwork@_custom_version",
+                "artwork@_custom_version_support",
+                "artwork_support",
+                {
+                    "channels": [
+                        {
+                            "source": "album",
+                            "format": "jpeg",
+                            "width": 300,
+                            "height": 300,
+                        }
+                    ]
+                },
+            ),
+            (
+                "visualizer@_custom_version",
+                "visualizer@_custom_version_support",
+                "visualizer_support",
+                {"buffer_capacity": 100_000, "rate_max": 30, "types": ["loudness"]},
+            ),
+        ],
+    )
+    def test_deserialize_client_hello_maps_custom_support(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        role_id: str,
+        support_key: str,
+        expected_attr: str,
+        support_payload: dict[str, object],
+    ) -> None:
+        """Registered custom role support keys are mapped into existing support fields."""
+        monkeypatch.setitem(ROLE_FACTORIES, role_id, lambda _client: None)  # type: ignore[arg-type]
+        raw = orjson.dumps(
+            {
+                "type": "client/hello",
+                "payload": {
+                    "client_id": "c1",
+                    "name": "Client",
+                    "version": 1,
+                    "supported_roles": [role_id],
+                    support_key: support_payload,
+                },
+            }
+        ).decode()
+
+        msg = SendspinConnection._deserialize_client_message(raw)  # noqa: SLF001
+        assert isinstance(msg, ClientHelloMessage)
+        assert getattr(msg.payload, expected_attr) is not None
+
+    @pytest.mark.parametrize(
+        ("role_id", "missing_support_key"),
+        [
+            ("player@_custom_version", "player@_custom_version_support"),
+            ("artwork@_custom_version", "artwork@_custom_version_support"),
+            ("visualizer@_custom_version", "visualizer@_custom_version_support"),
+        ],
+    )
+    def test_deserialize_client_hello_records_missing_custom_support_key(
+        self, monkeypatch: pytest.MonkeyPatch, role_id: str, missing_support_key: str
+    ) -> None:
+        """A registered custom role ID without its support key is recorded as missing it."""
+        monkeypatch.setitem(ROLE_FACTORIES, role_id, lambda _client: None)  # type: ignore[arg-type]
+        raw = orjson.dumps(
+            {
+                "type": "client/hello",
+                "payload": {
+                    "client_id": "c1",
+                    "name": "Client",
+                    "version": 1,
+                    "supported_roles": [role_id],
+                },
+            }
+        ).decode()
+
+        msg = SendspinConnection._deserialize_client_message(raw)  # noqa: SLF001
+        assert isinstance(msg, ClientHelloMessage)
+        assert msg.payload.missing_support_roles == [missing_support_key.removesuffix("_support")]
+        assert msg.payload.activatable_roles == []
+
+    # DEPRECATED(spec-pr-195): remove in aiosendspin <version>
+    # DEPRECATED(spec-pr-168): remove in aiosendspin <version>
+    def test_deserialize_artwork_hello_accepts_pre_rename_dimensions(self) -> None:
+        """media_width/media_height are rewritten to width/height and recorded."""
+        raw = orjson.dumps(
+            {
+                "type": "client/hello",
+                "payload": {
+                    "client_id": "c1",
+                    "name": "Client",
+                    "version": 1,
+                    "supported_roles": ["artwork@v1"],
+                    "artwork@v1_support": {
+                        "channels": [
+                            {
+                                "source": "album",
+                                "format": "jpeg",
+                                "media_width": 300,
+                                "media_height": 200,
+                            }
+                        ]
+                    },
+                },
+            }
+        ).decode()
+
+        msg = SendspinConnection._deserialize_client_message(raw)  # noqa: SLF001
+        assert isinstance(msg, ClientHelloMessage)
+        assert msg.payload.artwork_support is not None
+        channel = msg.payload.artwork_support.channels[0]
+        assert (channel.width, channel.height) == (300, 200)
+        assert channel.legacy_dimension_keys == ["media_width", "media_height"]
+
+    def test_deserialize_client_hello_records_legacy_support_key_use(self) -> None:
+        """Unversioned support keys are rewritten to v1 aliases and recorded, not logged."""
+        raw = orjson.dumps(
+            {
+                "type": "client/hello",
+                "payload": {
+                    "client_id": "c1",
+                    "name": "Client",
+                    "version": 1,
+                    "supported_roles": ["player@v1"],
+                    "player_support": {
+                        "supported_formats": [
+                            {
+                                "codec": "pcm",
+                                "sample_rate": 48000,
+                                "bit_depth": 16,
+                                "channels": 2,
+                            }
+                        ],
+                        "buffer_capacity": 100_000,
+                        "supported_commands": [],
+                    },
+                },
+            }
+        ).decode()
+
+        msg = SendspinConnection._deserialize_client_message(raw)  # noqa: SLF001
+        assert isinstance(msg, ClientHelloMessage)
+        assert msg.payload.player_support is not None
+        assert msg.payload.legacy_support_keys_used == ["player_support"]
+
+    def test_deserialize_client_hello_records_legacy_key_alongside_canonical(self) -> None:
+        """A hello sending both the legacy and versioned support keys still records the legacy."""
+        support = {
+            "supported_formats": [
+                {"codec": "pcm", "sample_rate": 48000, "bit_depth": 16, "channels": 2}
+            ],
+            "buffer_capacity": 100_000,
+            "supported_commands": [],
+        }
+        raw = orjson.dumps(
+            {
+                "type": "client/hello",
+                "payload": {
+                    "client_id": "c1",
+                    "name": "Client",
+                    "version": 1,
+                    "supported_roles": ["player@v1"],
+                    "player@v1_support": support,
+                    "player_support": support,
+                },
+            }
+        ).decode()
+
+        msg = SendspinConnection._deserialize_client_message(raw)  # noqa: SLF001
+        assert isinstance(msg, ClientHelloMessage)
+        assert msg.payload.player_support is not None
+        assert msg.payload.legacy_support_keys_used == ["player_support"]
+
+    def test_deserialize_client_hello_records_unlisted_support(self) -> None:
+        """A support object for a role not in supported_roles is dropped and recorded."""
+        raw = orjson.dumps(
+            {
+                "type": "client/hello",
+                "payload": {
+                    "client_id": "c1",
+                    "name": "Client",
+                    "version": 1,
+                    "supported_roles": [],
+                    "player@v1_support": {
+                        "supported_formats": [
+                            {
+                                "codec": "pcm",
+                                "sample_rate": 48000,
+                                "bit_depth": 16,
+                                "channels": 2,
+                            }
+                        ],
+                        "buffer_capacity": 100_000,
+                        "supported_commands": [],
+                    },
+                },
+            }
+        ).decode()
+
+        msg = SendspinConnection._deserialize_client_message(raw)  # noqa: SLF001
+        assert isinstance(msg, ClientHelloMessage)
+        assert msg.payload.player_support is None
+        assert msg.payload.unlisted_support_roles == ["player@v1"]
+
+    def test_deserialize_client_hello_ignores_spoofed_legacy_record(self) -> None:
+        """A versioned hello records nothing, even if it spoofs legacy_support_keys_used."""
+        raw = orjson.dumps(
+            {
+                "type": "client/hello",
+                "payload": {
+                    "client_id": "c1",
+                    "name": "Client",
+                    "version": 1,
+                    "supported_roles": ["player@v1"],
+                    "legacy_support_keys_used": ["player_support"],
+                    "player@v1_support": {
+                        "supported_formats": [
+                            {
+                                "codec": "pcm",
+                                "sample_rate": 48000,
+                                "bit_depth": 16,
+                                "channels": 2,
+                            }
+                        ],
+                        "buffer_capacity": 100_000,
+                        "supported_commands": [],
+                    },
+                },
+            }
+        ).decode()
+
+        msg = SendspinConnection._deserialize_client_message(raw)  # noqa: SLF001
+        assert isinstance(msg, ClientHelloMessage)
+        assert msg.payload.legacy_support_keys_used is None
+
+    def test_deserialize_client_hello_ignores_spoofed_unlisted_record(self) -> None:
+        """A hello with no unlisted support records nothing, even if it spoofs the field."""
+        raw = orjson.dumps(
+            {
+                "type": "client/hello",
+                "payload": {
+                    "client_id": "c1",
+                    "name": "Client",
+                    "version": 1,
+                    "supported_roles": ["player@v1"],
+                    "unlisted_support_roles": ["artwork@v1"],
+                    "player@v1_support": {
+                        "supported_formats": [
+                            {
+                                "codec": "pcm",
+                                "sample_rate": 48000,
+                                "bit_depth": 16,
+                                "channels": 2,
+                            }
+                        ],
+                        "buffer_capacity": 100_000,
+                        "supported_commands": [],
+                    },
+                },
+            }
+        ).decode()
+
+        msg = SendspinConnection._deserialize_client_message(raw)  # noqa: SLF001
+        assert isinstance(msg, ClientHelloMessage)
+        assert msg.payload.unlisted_support_roles is None
+
+    def test_legacy_visualizer_support_key_is_not_normalized_to_v1(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Legacy visualizer_support must not be rewritten to visualizer@v1_support."""
+        monkeypatch.setitem(ROLE_FACTORIES, "visualizer@_custom_r1", lambda _client: None)  # type: ignore[arg-type]
+
+        raw = orjson.dumps(
+            {
+                "type": "client/hello",
+                "payload": {
+                    "client_id": "c1",
+                    "name": "Client",
+                    "version": 1,
+                    "supported_roles": ["visualizer@_custom_r1"],
+                    "visualizer_support": {
+                        "types": ["loudness", "f_peak"],
+                        "buffer_capacity": 65536,
+                        "rate_max": 30,
+                    },
+                },
+            }
+        ).decode()
+
+        msg = SendspinConnection._deserialize_client_message(raw)  # noqa: SLF001
+        assert isinstance(msg, ClientHelloMessage)
+        assert msg.payload.visualizer_support is not None
+
+    def test_family_order_prefers_first_role_and_does_not_require_second_version_support(
+        self,
+    ) -> None:
+        """When v1 is listed before v2, parser must not require v2 support key."""
+        raw = orjson.dumps(
+            {
+                "type": "client/hello",
+                "payload": {
+                    "client_id": "c1",
+                    "name": "Client",
+                    "version": 1,
+                    "supported_roles": ["player@v1", "player@v2"],
+                    "player@v1_support": {
+                        "supported_formats": [
+                            {
+                                "codec": "pcm",
+                                "sample_rate": 48000,
+                                "bit_depth": 16,
+                                "channels": 2,
+                            }
+                        ],
+                        "buffer_capacity": 100_000,
+                        "supported_commands": [],
+                    },
+                },
+            }
+        ).decode()
+
+        msg = SendspinConnection._deserialize_client_message(raw)  # noqa: SLF001
+        assert isinstance(msg, ClientHelloMessage)
+        assert msg.payload.player_support is not None
+
+    def test_family_order_prefers_first_custom_role_and_requires_matching_support_key(self) -> None:
+        """When v2 is unregistered, parser falls back to first registered role in family."""
+        raw = orjson.dumps(
+            {
+                "type": "client/hello",
+                "payload": {
+                    "client_id": "c1",
+                    "name": "Client",
+                    "version": 1,
+                    "supported_roles": ["player@v2", "player@v1"],
+                    "player@v1_support": {
+                        "supported_formats": [
+                            {
+                                "codec": "pcm",
+                                "sample_rate": 48000,
+                                "bit_depth": 16,
+                                "channels": 2,
+                            }
+                        ],
+                        "buffer_capacity": 100_000,
+                        "supported_commands": [],
+                    },
+                },
+            }
+        ).decode()
+
+        msg = SendspinConnection._deserialize_client_message(raw)  # noqa: SLF001
+        assert isinstance(msg, ClientHelloMessage)
+        assert msg.payload.player_support is not None
+
+    def test_family_falls_back_when_preferred_version_lacks_support(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A registered v2 listed first without its support key falls back to v1."""
+        monkeypatch.setitem(ROLE_FACTORIES, "player@v2", lambda _client: None)  # type: ignore[arg-type]
+
+        raw = orjson.dumps(
+            {
+                "type": "client/hello",
+                "payload": {
+                    "client_id": "c1",
+                    "name": "Client",
+                    "version": 1,
+                    "supported_roles": ["player@v2", "player@v1"],
+                    "player@v1_support": {
+                        "supported_formats": [
+                            {
+                                "codec": "pcm",
+                                "sample_rate": 48000,
+                                "bit_depth": 16,
+                                "channels": 2,
+                            }
+                        ],
+                        "buffer_capacity": 100_000,
+                        "supported_commands": [],
+                    },
+                },
+            }
+        ).decode()
+
+        msg = SendspinConnection._deserialize_client_message(raw)  # noqa: SLF001
+        assert isinstance(msg, ClientHelloMessage)
+        assert msg.payload.missing_support_roles == ["player@v2"]
+        assert msg.payload.player_support is not None
+        assert negotiate_roles(msg.payload.activatable_roles) == ["player@v1"]
+
+    def test_family_falls_back_past_custom_version_without_support(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A registered custom version without support falls back to the next one that has it."""
+        monkeypatch.setitem(ROLE_FACTORIES, "player@_a", lambda _client: None)  # type: ignore[arg-type]
+        monkeypatch.setitem(ROLE_FACTORIES, "player@_b", lambda _client: None)  # type: ignore[arg-type]
+
+        raw = orjson.dumps(
+            {
+                "type": "client/hello",
+                "payload": {
+                    "name": "Client",
+                    "supported_roles": ["player@_a", "player@_b"],
+                    "player@_b_support": {
+                        "supported_formats": [
+                            {"codec": "pcm", "sample_rate": 48000, "bit_depth": 16, "channels": 2}
+                        ],
+                        "buffer_capacity": 100_000,
+                    },
+                },
+            }
+        ).decode()
+
+        msg = SendspinConnection._deserialize_client_message(raw)  # noqa: SLF001
+        assert isinstance(msg, ClientHelloMessage)
+        assert msg.payload.missing_support_roles == ["player@_a"]
+        assert msg.payload.player_support is not None
+        assert negotiate_roles(msg.payload.activatable_roles) == ["player@_b"]
+
+    def test_registered_custom_versions_without_support_are_each_recorded_once(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Every listed custom version lacking support is recorded once, then selection stops."""
+        monkeypatch.setitem(ROLE_FACTORIES, "player@_x", lambda _client: None)  # type: ignore[arg-type]
+        monkeypatch.setitem(ROLE_FACTORIES, "player@_y", lambda _client: None)  # type: ignore[arg-type]
+
+        raw = orjson.dumps(
+            {
+                "type": "client/hello",
+                "payload": {"name": "Client", "supported_roles": ["player@_x", "player@_y"]},
+            }
+        ).decode()
+
+        msg = SendspinConnection._deserialize_client_message(raw)  # noqa: SLF001
+        assert isinstance(msg, ClientHelloMessage)
+        assert msg.payload.missing_support_roles == ["player@_x", "player@_y"]
+        assert msg.payload.player_support is None
+
+    def test_family_falls_back_to_custom_version_with_support(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """player@v1 without support falls back to a registered custom version that has it."""
+        monkeypatch.setitem(ROLE_FACTORIES, "player@_custom", lambda _client: None)  # type: ignore[arg-type]
+
+        raw = orjson.dumps(
+            {
+                "type": "client/hello",
+                "payload": {
+                    "name": "Client",
+                    "supported_roles": ["player@v1", "player@_custom"],
+                    "player@_custom_support": {
+                        "supported_formats": [
+                            {"codec": "pcm", "sample_rate": 48000, "bit_depth": 16, "channels": 2}
+                        ],
+                        "buffer_capacity": 100_000,
+                    },
+                },
+            }
+        ).decode()
+
+        msg = SendspinConnection._deserialize_client_message(raw)  # noqa: SLF001
+        assert isinstance(msg, ClientHelloMessage)
+        assert msg.payload.missing_support_roles == ["player@v1"]
+        assert msg.payload.player_support is not None
+        assert negotiate_roles(msg.payload.activatable_roles) == ["player@_custom"]
+
+    def test_legacy_family_support_key_used_for_custom_role(self) -> None:
+        """A client that sends the legacy <family>_support key still binds for custom roles."""
+        raw = orjson.dumps(
+            {
+                "type": "client/hello",
+                "payload": {
+                    "client_id": "c1",
+                    "name": "Client",
+                    "version": 1,
+                    "supported_roles": ["visualizer@v1", "visualizer@_custom_legacy"],
+                    "visualizer_support": {
+                        "types": ["loudness"],
+                        "buffer_capacity": 65_536,
+                        "rate_max": 30,
+                    },
+                },
+            }
+        ).decode()
+
+        msg = SendspinConnection._deserialize_client_message(raw)  # noqa: SLF001
+        assert isinstance(msg, ClientHelloMessage)
+        assert msg.payload.visualizer_support is not None
+
+    def test_unknown_future_visualizer_version_ignored_with_schema_drift(self) -> None:
+        """Unregistered spec-versioned roles must not be parsed against the family schema.
+
+        Reproduces the forward-compat trap: a client running a future protocol
+        version sends `visualizer@v99_support` whose schema diverges from the
+        registered v1 spec. The server has no role registered for `v99` so per
+        spec it must ignore the role and proceed. The current implementation
+        greedy-parses against the v1 schema and raises MissingField.
+        """
+        raw = orjson.dumps(
+            {
+                "type": "client/hello",
+                "payload": {
+                    "client_id": "c1",
+                    "name": "Client",
+                    "version": 1,
+                    "supported_roles": ["visualizer@v99"],
+                    "visualizer@v99_support": {
+                        "buffer_capacity": 65536,
+                        "spectrum": {
+                            "n_disp_bins": 48,
+                            "scale": "mel",
+                            "f_min": 20,
+                            "f_max": 20000,
+                            "rate_max": 30,
+                        },
+                    },
+                },
+            }
+        ).decode()
+
+        msg = SendspinConnection._deserialize_client_message(raw)  # noqa: SLF001
+        assert isinstance(msg, ClientHelloMessage)
+        assert msg.payload.visualizer_support is None
+
+    def test_unknown_future_player_version_ignored_with_schema_drift(self) -> None:
+        """A future player@vN support payload missing v1's required fields must not crash."""
+        raw = orjson.dumps(
+            {
+                "type": "client/hello",
+                "payload": {
+                    "client_id": "c1",
+                    "name": "Client",
+                    "version": 1,
+                    "supported_roles": ["player@v99"],
+                    "player@v99_support": {"buffer_capacity": 100_000},
+                },
+            }
+        ).decode()
+
+        msg = SendspinConnection._deserialize_client_message(raw)  # noqa: SLF001
+        assert isinstance(msg, ClientHelloMessage)
+        assert msg.payload.player_support is None
+
+    def test_unknown_future_artwork_version_ignored_with_schema_drift(self) -> None:
+        """A future artwork@vN support payload missing v1's required fields must not crash."""
+        raw = orjson.dumps(
+            {
+                "type": "client/hello",
+                "payload": {
+                    "client_id": "c1",
+                    "name": "Client",
+                    "version": 1,
+                    "supported_roles": ["artwork@v99"],
+                    "artwork@v99_support": {"some_new_field": "value"},
+                },
+            }
+        ).decode()
+
+        msg = SendspinConnection._deserialize_client_message(raw)  # noqa: SLF001
+        assert isinstance(msg, ClientHelloMessage)
+        assert msg.payload.artwork_support is None
+
+    # DEPRECATED(spec-pr-86): remove in aiosendspin <version>
+    def test_hello_with_draft_r1_only_parses_and_negotiates(self) -> None:
+        """Legacy `visualizer@_draft_r1` clients are still fully supported.
+
+        Wire-format round-trip: deserialize the hello, then run negotiation and
+        confirm the legacy role is the one that gets activated.
+        """
+        raw = orjson.dumps(
+            {
+                "type": "client/hello",
+                "payload": {
+                    "client_id": "c1",
+                    "name": "Client",
+                    "version": 1,
+                    "supported_roles": ["visualizer@_draft_r1"],
+                    "visualizer@_draft_r1_support": {
+                        "types": ["loudness"],
+                        "buffer_capacity": 65_536,
+                        "spectrum": {
+                            "n_disp_bins": 48,
+                            "scale": "mel",
+                            "f_min": 20,
+                            "f_max": 20000,
+                            "rate_max": 30,
+                        },
+                    },
+                },
+            }
+        ).decode()
+
+        msg = SendspinConnection._deserialize_client_message(raw)  # noqa: SLF001
+        assert isinstance(msg, ClientHelloMessage)
+        assert msg.payload.visualizer_draft_r1_support is not None
+        assert msg.payload.visualizer_support is None
+        assert "visualizer@_draft_r1" in negotiate_roles(msg.payload.supported_roles)
+
+    def test_hello_with_v2_and_v1_mixed_falls_back_to_v1(self) -> None:
+        """When client offers `[v2, v1]` and server knows only v1, v1 is activated.
+
+        Reaches the architecture limit gracefully: client lists a newer protocol
+        version first, but the server picks the highest version it actually
+        registers. The unknown v2 support payload must be ignored, not parsed.
+        """
+        raw = orjson.dumps(
+            {
+                "type": "client/hello",
+                "payload": {
+                    "client_id": "c1",
+                    "name": "Client",
+                    "version": 1,
+                    "supported_roles": ["visualizer@v2", "visualizer@v1"],
+                    "visualizer@v2_support": {"completely": "different schema"},
+                    "visualizer@v1_support": {
+                        "buffer_capacity": 65_536,
+                        "rate_max": 30,
+                        "types": ["loudness"],
+                    },
+                },
+            }
+        ).decode()
+
+        msg = SendspinConnection._deserialize_client_message(raw)  # noqa: SLF001
+        assert isinstance(msg, ClientHelloMessage)
+        assert msg.payload.visualizer_support is not None
+        assert negotiate_roles(msg.payload.supported_roles) == ["visualizer@v1"]
+
+    def test_hello_with_only_v2_drops_visualizer_role_entirely(self) -> None:
+        """Lone unsupported version → deserialize succeeds and family is inactive.
+
+        Spec: server should ignore unknown roles. Active_roles must reflect this
+        so the client can detect outdated servers and degrade gracefully.
+        """
+        raw = orjson.dumps(
+            {
+                "type": "client/hello",
+                "payload": {
+                    "client_id": "c1",
+                    "name": "Client",
+                    "version": 1,
+                    "supported_roles": ["visualizer@v2"],
+                    "visualizer@v2_support": {"unknown_field": 1},
+                },
+            }
+        ).decode()
+
+        msg = SendspinConnection._deserialize_client_message(raw)  # noqa: SLF001
+        assert isinstance(msg, ClientHelloMessage)
+        assert msg.payload.visualizer_support is None
+        assert msg.payload.visualizer_draft_r1_support is None
+        assert negotiate_roles(msg.payload.supported_roles) == []
+
+    @pytest.mark.parametrize(
+        ("supported_roles", "expected"),
+        [
+            (["controller@v2"], ["controller@v2"]),  # unknown version of a known family
+            (["foobar@v1"], ["foobar@v1"]),  # unknown family
+            (["controller@v1", "metadata@v1"], []),  # implemented
+            (["_custom@v1", "player@_draft"], []),  # custom family / version excluded
+            (["player", "@v1", "metadata@"], []),  # unversioned, flagged separately
+            (["player@v1", "controller@v2", "foobar@v3"], ["controller@v2", "foobar@v3"]),
+        ],
+    )
+    def test_unimplemented_roles_flags_unknown_non_custom(
+        self, supported_roles: list[str], expected: list[str]
+    ) -> None:
+        """Roles/versions the server does not implement are tracked, excluding `_` custom ones."""
+        assert SendspinConnection._unimplemented_roles(supported_roles) == expected  # noqa: SLF001
+
+    @pytest.mark.parametrize("role_id", ["crystalball@v1", "_crystalball@v1"])
+    def test_hello_with_brand_new_family_does_not_crash(self, role_id: str) -> None:
+        """A family the server has never heard of is silently ignored end-to-end.
+
+        Guards against future role additions on the client side that the server
+        doesn't know about yet.
+        """
+        raw = orjson.dumps(
+            {
+                "type": "client/hello",
+                "payload": {
+                    "client_id": "c1",
+                    "name": "Client",
+                    "version": 1,
+                    "supported_roles": [role_id],
+                    f"{role_id}_support": {"forecast": "cloudy"},
+                },
+            }
+        ).decode()
+
+        msg = SendspinConnection._deserialize_client_message(raw)  # noqa: SLF001
+        assert isinstance(msg, ClientHelloMessage)
+        assert negotiate_roles(msg.payload.supported_roles) == []
+
+    @pytest.mark.parametrize(
+        "support",
+        [
+            {
+                "supported_formats": [
+                    {"codec": "pcm", "channels": 2, "sample_rate": 48000, "bit_depth": 16}
+                ],
+                "buffer_capacity": 100_000,
+            },
+            {"only": "garbage"},
+        ],
+    )
+    def test_unregistered_custom_version_support_is_ignored(
+        self, support: dict[str, object]
+    ) -> None:
+        """An unregistered custom version's support object is not parsed as the family's."""
+        raw = orjson.dumps(
+            {
+                "type": "client/hello",
+                "payload": {
+                    "name": "Client",
+                    "supported_roles": ["player@_experimental"],
+                    "player@_experimental_support": support,
+                },
+            }
+        ).decode()
+
+        msg = SendspinConnection._deserialize_client_message(raw)  # noqa: SLF001
+        assert isinstance(msg, ClientHelloMessage)
+        assert msg.payload.player_support is None
+
+
+class TestClientUrlRegistration:
+    """Tests that client URLs are registered after successful handshake."""
+
+    @pytest.mark.asyncio
+    async def test_url_registered_after_handshake(self, mock_server: _MockServer) -> None:
+        """Client URL is registered after the hello exchange for a server-initiated connection."""
+        url = "ws://192.168.1.100:8927/sendspin"
+        conn = SendspinConnection(mock_server, wsock_client=AsyncMock(), url=url)
+
+        await _exchange_hellos_encrypted(conn, client_id="my-speaker")
+
+        assert mock_server.get_client_url("my-speaker") == url
+
+    @pytest.mark.asyncio
+    async def test_url_not_registered_for_client_initiated(self, mock_server: _MockServer) -> None:
+        """Client URL is NOT registered for client-initiated connections (no URL to store)."""
+        request = MagicMock(spec=web.Request)
+        request.remote = "192.168.1.50"
+
+        conn = SendspinConnection(mock_server, request=request)
+        conn._wsock_server = AsyncMock()  # noqa: SLF001
+        conn._wsock_server.closed = False  # noqa: SLF001
+
+        await _exchange_hellos_encrypted(conn, client_id="my-speaker")
+
+        # No URL should be registered since we don't know the client's WebSocket URL
+        assert mock_server.get_client_url("my-speaker") is None
+
+
+@dataclass
+class _MockServerWithReclaim:
+    """Mock server that tracks reclaim calls."""
+
+    loop: asyncio.AbstractEventLoop
+    clock: LoopClock
+    id: str = "srv"
+    name: str = "server"
+
+    _reclaim_calls: list[str] = field(default_factory=list)
+
+    def request_client_playback_connection(self, client_id: str) -> bool:
+        self._reclaim_calls.append(client_id)
+        return True
+
+    def is_external_player(self, client_id: str) -> bool:  # noqa: ARG002
+        return False
+
+    def _signal_client_connected(self, client_id: str) -> None:
+        pass
+
+    def _signal_client_disconnected(self, client_id: str, goodbye_reason: object) -> None:
+        pass
+
+
+class TestAutomaticReclaim:
+    """Tests for automatic client reclaim on playback start and group join."""
+
+    @pytest.mark.asyncio
+    async def test_start_stream_reclaims_disconnected_clients(self) -> None:
+        """start_stream() reclaims disconnected clients in the group."""
+        loop = asyncio.get_running_loop()
+        server = _MockServerWithReclaim(loop=loop, clock=LoopClock(loop))
+
+        # Create a client and group
+        client = SendspinClient(server, client_id="speaker-1")
+        group = SendspinGroup(server, client)
+
+        # Connect and then disconnect the client (simulating another_server goodbye)
+        conn = _DummyConnection()
+        client.attach_connection(
+            conn,
+            client_info=_player_hello("speaker-1"),
+            negotiated_roles=[Roles.PLAYER.value],
+            active_roles=[Roles.PLAYER.value],
+        )
+        client.mark_connected()
+
+        # Store URL for reclaim
+        server._client_urls = {"speaker-1": "ws://192.168.1.50:8927/sendspin"}  # type: ignore[attr-defined]  # noqa: SLF001
+
+        # Disconnect the client
+        client.detach_connection(None)
+        assert not client.is_connected
+
+        # Start a stream - should trigger reclaim
+        group.start_stream()
+
+        assert "speaker-1" in server._reclaim_calls  # noqa: SLF001
+
+    @pytest.mark.asyncio
+    async def test_add_client_reclaims_if_group_has_active_playback(self) -> None:
+        """add_client() reclaims disconnected client when group has active playback."""
+        loop = asyncio.get_running_loop()
+        server = _MockServerWithReclaim(loop=loop, clock=LoopClock(loop))
+
+        # Create two clients - one connected, one disconnected
+        client1 = SendspinClient(server, client_id="speaker-1")
+        client2 = SendspinClient(server, client_id="speaker-2")
+        group1 = SendspinGroup(server, client1)
+        SendspinGroup(server, client2)
+
+        # Connect client1 and start playback
+        conn1 = _DummyConnection()
+        client1.attach_connection(
+            conn1,
+            client_info=_player_hello("speaker-1"),
+            negotiated_roles=[Roles.PLAYER.value],
+            active_roles=[Roles.PLAYER.value],
+        )
+        client1.mark_connected()
+        group1.start_stream()
+
+        # Clear reclaim calls from start_stream (client1 was connected)
+        server._reclaim_calls.clear()  # noqa: SLF001
+
+        # Connect and disconnect client2
+        conn2 = _DummyConnection()
+        client2.attach_connection(
+            conn2,
+            client_info=_player_hello("speaker-2"),
+            negotiated_roles=[Roles.PLAYER.value],
+            active_roles=[Roles.PLAYER.value],
+        )
+        client2.mark_connected()
+        client2.detach_connection(None)
+        assert not client2.is_connected
+
+        # Store URL for reclaim
+        server._client_urls = {"speaker-2": "ws://192.168.1.51:8927/sendspin"}  # type: ignore[attr-defined]  # noqa: SLF001
+
+        # Add disconnected client2 to group1 (which has active playback)
+        await group1.add_client(client2)
+
+        assert "speaker-2" in server._reclaim_calls  # noqa: SLF001
+
+    @pytest.mark.asyncio
+    async def test_add_client_does_not_reclaim_if_connected(self) -> None:
+        """add_client() does not reclaim if client is already connected."""
+        loop = asyncio.get_running_loop()
+        server = _MockServerWithReclaim(loop=loop, clock=LoopClock(loop))
+
+        # Create two clients
+        client1 = SendspinClient(server, client_id="speaker-1")
+        client2 = SendspinClient(server, client_id="speaker-2")
+        group1 = SendspinGroup(server, client1)
+        SendspinGroup(server, client2)
+
+        # Connect both clients
+        conn1 = _DummyConnection()
+        client1.attach_connection(
+            conn1,
+            client_info=_player_hello("speaker-1"),
+            negotiated_roles=[Roles.PLAYER.value],
+            active_roles=[Roles.PLAYER.value],
+        )
+        client1.mark_connected()
+
+        conn2 = _DummyConnection()
+        client2.attach_connection(
+            conn2,
+            client_info=_player_hello("speaker-2"),
+            negotiated_roles=[Roles.PLAYER.value],
+            active_roles=[Roles.PLAYER.value],
+        )
+        client2.mark_connected()
+
+        # Start playback on group1
+        group1.start_stream()
+        server._reclaim_calls.clear()  # noqa: SLF001
+
+        # Add connected client2 to group1
+        await group1.add_client(client2)
+
+        # Should not try to reclaim since client2 is connected
+        assert "speaker-2" not in server._reclaim_calls  # noqa: SLF001
+
+    @pytest.mark.asyncio
+    async def test_add_client_does_not_reclaim_if_no_active_playback(self) -> None:
+        """add_client() does not reclaim if group has no active playback."""
+        loop = asyncio.get_running_loop()
+        server = _MockServerWithReclaim(loop=loop, clock=LoopClock(loop))
+
+        # Create two clients
+        client1 = SendspinClient(server, client_id="speaker-1")
+        client2 = SendspinClient(server, client_id="speaker-2")
+        group1 = SendspinGroup(server, client1)
+        SendspinGroup(server, client2)
+
+        # Connect client1 but don't start playback
+        conn1 = _DummyConnection()
+        client1.attach_connection(
+            conn1,
+            client_info=_player_hello("speaker-1"),
+            negotiated_roles=[Roles.PLAYER.value],
+            active_roles=[Roles.PLAYER.value],
+        )
+        client1.mark_connected()
+
+        # Connect and disconnect client2
+        conn2 = _DummyConnection()
+        client2.attach_connection(
+            conn2,
+            client_info=_player_hello("speaker-2"),
+            negotiated_roles=[Roles.PLAYER.value],
+            active_roles=[Roles.PLAYER.value],
+        )
+        client2.mark_connected()
+        client2.detach_connection(None)
+
+        # Add disconnected client2 to group1 (no active playback)
+        await group1.add_client(client2)
+
+        # Should not try to reclaim since no active playback
+        assert "speaker-2" not in server._reclaim_calls  # noqa: SLF001
+
+    @pytest.mark.asyncio
+    async def test_add_client_replaces_stale_client_with_same_client_id(self) -> None:
+        """add_client() replaces stale client objects that share the same client_id."""
+        loop = asyncio.get_running_loop()
+        server = _MockServerWithReclaim(loop=loop, clock=LoopClock(loop))
+
+        owner = SendspinClient(server, client_id="speaker-1")
+        stale = SendspinClient(server, client_id="speaker-2")
+        replacement = SendspinClient(server, client_id="speaker-2")
+
+        group1 = SendspinGroup(server, owner, stale)
+        SendspinGroup(server, replacement)
+
+        await group1.add_client(replacement)
+
+        # Group membership should contain only the replacement object for speaker-2.
+        speaker2_members = [c for c in group1.clients if c.client_id == "speaker-2"]
+        assert speaker2_members == [replacement]
+        assert stale not in group1.clients

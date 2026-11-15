@@ -1,0 +1,222 @@
+// Package evdev is the raw evdev and uinput plumbing, dependency-free so it
+// cross-compiles to ARMv7 with CGO_ENABLED=0.
+package evdev
+
+import (
+	"encoding/binary"
+	"fmt"
+	"io"
+	"os"
+	"syscall"
+	"unsafe"
+)
+
+const (
+	evSyn = 0x00
+	EvKey = 0x01
+
+	synReport = 0x00
+
+	// EV_KEY values; 2 is autorepeat.
+	KeyRelease = 0
+	KeyPress   = 1
+
+	// _IOW('E', 0x90, int)
+	eviocgrab = 0x40044590
+
+	// KEY_MAX is 0x2ff, so the key bitmap is 96 bytes.
+	keyBytes = 96
+
+	// EVIOCGBIT(EvKey, 96) = _IOC(_IOC_READ, 'E', 0x20+EvKey, 96)
+	//   (2<<30) | (96<<16) | ('E'<<8) | 0x21
+	eviocgbitKey = 0x80604521
+
+	// struct input_id is four u16: bustype, vendor, product, version.
+	idBytes = 8
+
+	// EVIOCGID = _IOR('E', 0x02, struct input_id)
+	//   (2<<30) | (8<<16) | ('E'<<8) | 0x02
+	eviocgid = 0x80084502
+
+	uinputNode = "/dev/uinput"
+
+	uiSetEvbit   = 0x40045564 // _IOW(UINPUT_IOCTL_BASE, 100, int)
+	uiSetKeybit  = 0x40045565 // _IOW(UINPUT_IOCTL_BASE, 101, int)
+	uiDevCreate  = 0x5501     // _IO(UINPUT_IOCTL_BASE, 1)
+	uiDevDestroy = 0x5502     // _IO(UINPUT_IOCTL_BASE, 2)
+
+	EventSize = 16 // sec(4) + usec(4) + type(2) + code(2) + value(4)
+)
+
+const _ = uint(8 - unsafe.Sizeof(syscall.Timeval{}))
+
+type Event struct {
+	Sec   int32
+	Usec  int32
+	Type  uint16
+	Code  uint16
+	Value int32
+}
+
+func (e Event) marshal() []byte {
+	b := make([]byte, EventSize)
+	binary.LittleEndian.PutUint32(b[0:], uint32(e.Sec))
+	binary.LittleEndian.PutUint32(b[4:], uint32(e.Usec))
+	binary.LittleEndian.PutUint16(b[8:], e.Type)
+	binary.LittleEndian.PutUint16(b[10:], e.Code)
+	binary.LittleEndian.PutUint32(b[12:], uint32(e.Value))
+	return b
+}
+
+func Unmarshal(b []byte) Event {
+	return Event{
+		Sec:   int32(binary.LittleEndian.Uint32(b[0:])),
+		Usec:  int32(binary.LittleEndian.Uint32(b[4:])),
+		Type:  binary.LittleEndian.Uint16(b[8:]),
+		Code:  binary.LittleEndian.Uint16(b[10:]),
+		Value: int32(binary.LittleEndian.Uint32(b[12:])),
+	}
+}
+
+func control(f *os.File, call func(fd uintptr) error) error {
+	conn, err := f.SyscallConn()
+	if err != nil {
+		return err
+	}
+	inner := error(nil)
+	if err := conn.Control(func(fd uintptr) { inner = call(fd) }); err != nil {
+		return err
+	}
+	return inner
+}
+
+func ioctlPtr(fd uintptr, req uint, p unsafe.Pointer) error {
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, fd, uintptr(req), uintptr(p))
+	if errno != 0 {
+		return errno
+	}
+	return nil
+}
+
+func ioctl(fd uintptr, req uint, arg uintptr) error {
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, fd, uintptr(req), arg)
+	if errno != 0 {
+		return errno
+	}
+	return nil
+}
+
+type InputID struct {
+	Bus     uint16
+	Vendor  uint16
+	Product uint16
+	Version uint16
+}
+
+func DeviceID(f *os.File) (InputID, error) {
+	buf := make([]byte, idBytes)
+	if err := control(f, func(fd uintptr) error {
+		return ioctlPtr(fd, eviocgid, unsafe.Pointer(&buf[0]))
+	}); err != nil {
+		return InputID{}, fmt.Errorf("EVIOCGID: %w", err)
+	}
+	return idFromBytes(buf), nil
+}
+
+func idFromBytes(buf []byte) InputID {
+	return InputID{
+		Bus:     binary.LittleEndian.Uint16(buf[0:]),
+		Vendor:  binary.LittleEndian.Uint16(buf[2:]),
+		Product: binary.LittleEndian.Uint16(buf[4:]),
+		Version: binary.LittleEndian.Uint16(buf[6:]),
+	}
+}
+
+func DeviceKeys(f *os.File) ([]uint16, error) {
+	buf := make([]byte, keyBytes)
+	if err := control(f, func(fd uintptr) error {
+		return ioctlPtr(fd, eviocgbitKey, unsafe.Pointer(&buf[0]))
+	}); err != nil {
+		return nil, fmt.Errorf("EVIOCGBIT(EvKey): %w", err)
+	}
+	return keysFromBitmap(buf), nil
+}
+
+func keysFromBitmap(buf []byte) []uint16 {
+	var keys []uint16
+	for i := 0; i < len(buf)*8; i++ {
+		if buf[i/8]&(1<<uint(i%8)) != 0 {
+			keys = append(keys, uint16(i))
+		}
+	}
+	return keys
+}
+
+func Grab(f *os.File, on bool) error {
+	v := uintptr(0)
+	if on {
+		v = 1
+	}
+	if err := control(f, func(fd uintptr) error { return ioctl(fd, eviocgrab, v) }); err != nil {
+		return fmt.Errorf("eviocgrab(%v): %w", on, err)
+	}
+	return nil
+}
+
+type Uinput struct{ f *os.File }
+
+func NewUinput(name string, id InputID, keys []uint16) (*Uinput, error) {
+	file, err := os.OpenFile(uinputNode, os.O_WRONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open %s: %w", uinputNode, err)
+	}
+	if err := ioctl(file.Fd(), uiSetEvbit, EvKey); err != nil {
+		file.Close()
+		return nil, fmt.Errorf("uiSetEvbit: %w", err)
+	}
+	for _, k := range keys {
+		if err := ioctl(file.Fd(), uiSetKeybit, uintptr(k)); err != nil {
+			file.Close()
+			return nil, fmt.Errorf("uiSetKeybit(%d): %w", k, err)
+		}
+	}
+
+	if _, err := file.Write(userDev(name, id)); err != nil {
+		file.Close()
+		return nil, fmt.Errorf("write uinput_user_dev: %w", err)
+	}
+	if err := ioctl(file.Fd(), uiDevCreate, 0); err != nil {
+		file.Close()
+		return nil, fmt.Errorf("uiDevCreate: %w", err)
+	}
+	return &Uinput{f: file}, nil
+}
+
+func userDev(name string, id InputID) []byte {
+	// struct uinput_user_dev, 32-bit layout:
+	//   char name[80]; struct input_id{u16 x4}; int ff_effects_max;
+	//   int absmax[64]; absmin[64]; absfuzz[64]; absflat[64]
+	const devSize = 80 + 8 + 4 + 4*64*4
+	buf := make([]byte, devSize)
+	copy(buf[:79], name) // 79, so the name is always NUL-terminated
+	binary.LittleEndian.PutUint16(buf[80:], id.Bus)
+	binary.LittleEndian.PutUint16(buf[82:], id.Vendor)
+	binary.LittleEndian.PutUint16(buf[84:], id.Product)
+	binary.LittleEndian.PutUint16(buf[86:], id.Version)
+	return buf
+}
+
+func (u *Uinput) Emit(code uint16, value int32) error { return emit(u.f, code, value) }
+
+func emit(w io.Writer, code uint16, value int32) error {
+	if _, err := w.Write(Event{Type: EvKey, Code: code, Value: value}.marshal()); err != nil {
+		return err
+	}
+	_, err := w.Write(Event{Type: evSyn, Code: synReport, Value: 0}.marshal())
+	return err
+}
+
+func (u *Uinput) Close() error {
+	_ = ioctl(u.f.Fd(), uiDevDestroy, 0)
+	return u.f.Close()
+}

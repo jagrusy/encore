@@ -1,0 +1,37 @@
+[submodule "common/dmap-parser"]
+	path = common/dmap-parser
+	url = https://github.com/philippe44/dmap-parser
+[submodule "aircast/nanopb"]
+	path = aircast/nanopb
+	url = https://github.com/nanopb/nanopb
+[submodule "aircast/libjansson"]
+	path = aircast/libjansson
+	url = https://github.com/philippe44/libjansson
+	fetchRecurseSubmodules = no	
+[submodule "common/libpupnp"]
+	path = common/libpupnp
+	url = https://github.com/philippe44/libpupnp
+	fetchRecurseSubmodules = no	
+[submodule "common/libopenssl"]
+	path = common/libopenssl
+	url = https://github.com/philippe44/libopenssl
+	fetchRecurseSubmodules = no	
+[submodule "common/libmdns"]
+	path = common/libmdns
+	url = https://github.com/philippe44/libmdns
+	fetchRecurseSubmodules = no
+[submodule "common/libcodecs"]
+	path = common/libcodecs
+	url = https://github.com/philippe44/libcodecs
+	fetchRecurseSubmodules = no
+[submodule "common/crosstools"]
+	path = common/crosstools
+	url = https://github.com/philippe44/crosstools
+[submodule "common/libraop"]
+	path = common/libraop
+	url = https://github.com/philippe44/libraop
+	fetchRecurseSubmodules = no	
+[submodule "common/libpthreads4w"]
+	path = common/libpthreads4w
+	url = https://github.com/philippe44/libpthreads4w
+	fetchRecurseSubmodules = no	

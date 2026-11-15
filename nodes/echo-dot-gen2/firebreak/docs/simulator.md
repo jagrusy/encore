@@ -1,0 +1,800 @@
+# The simulator
+
+`simulator/` runs firebreak against a simulated Dot. No Dot, real `adb`, real
+`fastboot`, real serial port or real USB device takes part.
+
+## Running it
+
+```sh
+simulator/run.sh OUT unlock fireos5
+START=no-light simulator/run.sh OUT short --device biscuit
+START=twrp simulator/run.sh OUT stock 8149
+DEVICE=radar simulator/run.sh OUT unlock fireos6
+DEVICE=radar START=twrp simulator/run.sh OUT stock 6436
+DEVICE=radar START=no-light simulator/run.sh OUT short --device radar
+DEVICE=donut START=stock-booted simulator/run.sh OUT unlock fireos6
+FIREBREAK_SIM_ELEVATES=0 DEVICE=donut START=stock-booted simulator/run.sh OUT unlock fireos6
+DEVICE=donut START=twrp simulator/run.sh OUT stock 8349
+DEVICE=radar START=twrp simulator/run.sh OUT backup BACKUP
+DEVICE=radar simulator/run.sh OUT restore --force BACKUP
+python3 simulator/trace.py OUT.jsonl             # one command per line, for diff
+python3 simulator/trace.py --commands OUT.jsonl  # with the payload commands per range
+```
+
+- `run.sh` makes a new Dot, runs firebreak, and leaves `OUT.log`, the trace
+  (`OUT.jsonl` and `OUT.txt`), a disk snapshot (`OUT.snapshot`) and the raw
+  partition table (`OUT.table`: LBA 0 to 33, then the last 33 sectors).
+- `run.sh` destroys the Dot when it exits, also on Ctrl-C or `SIGTERM`. First
+  it stops firebreak and the loop that waits to plug the Dot in, and waits for
+  both. A `plug` in progress runs to its end. A Dot made with
+  `python3 simulator/dot.py create` stays until `python3 simulator/dot.py destroy`.
+- `run.sh` passes its pid to `create`. `create` refuses while the `run.sh`
+  that the state names still runs.
+- It needs Docker, `uv`, `timeout` (coreutils, on macOS too), and the
+  downloads in `~/.cache/firebreak`. The image build downloads busybox, pigz
+  and toybox source and checks each by SHA-256.
+- firebreak's cache is `~/.cache/firebreak-sim-cache`. `dot.py create` copies
+  each download into its `firebreak` folder, as an APFS clone on macOS and
+  with `--reflink=auto` elsewhere. Where a clone fails, as off APFS, it copies
+  the file. So a run that writes a file in place changes only the copy. A copy
+  whose size or modification time is not its download's is copied again. What
+  a run builds there stays for the next run.
+- State and the trace are in `~/.cache/firebreak-sim`. `FIREBREAK_SIM` and
+  `FIREBREAK_SIM_CACHE` move the two, so several Dots can run at once. Each
+  Dot needs its own pair, so one Dot's downloads and images are not another's.
+- `create` refuses a `FIREBREAK_SIM_CACHE`, or a `firebreak` folder in it,
+  that is the same directory as `~/.cache` or `~/.cache/firebreak`, or as
+  `$XDG_CACHE_HOME` or its `firebreak` folder. It compares device and inode,
+  so another case, a link, a trailing slash or a relative path does not get
+  past it. It also refuses when `HOME` is not set, and when the `firebreak`
+  folder is a link. firebreak would otherwise write the real cache.
+- `START=fastboot`, the default, starts in stock fastboot. `START=no-light`
+  erases boot0 and leaves the Dot unplugged. `run.sh` plugs it in when
+  firebreak asks for the short, asks for the bootrom as the start of an
+  unlock, waits for an Echo on USB, or waits for an Echo to say which device
+  it is. The last two are runs that start with nothing plugged in, where a
+  real Dot that shows no light would be shorted as it is plugged in.
+- `START=stock-booted` starts the stock Fire OS it was created with. Nothing
+  there answers adb, so a command that needs a reboot asks for the button
+  gesture and waits: the simulator performs no gesture, which is the one entry
+  the grid below can only check as far as the question. `bootrom` refuses that
+  state outright, which it does check.
+- `START=twrp` writes amonet v2's chain and starts its TWRP. `create` writes
+  it with the same code the fastbrick does, from the same zip, so the Dot
+  arrives where the fastbrick leaves it: v2's LK in both slots, v2's TEE in
+  `tee1` and `tee2`, the kaeru payload in `expdb`, v2's TWRP in `recovery`,
+  and the stock table, which v2's plan leaves alone from stock. That is the
+  state part way through an unlock, not the state one ends in: the plan also
+  writes amonet's preloader to boot0 and zeroes the RPMB, and this start does
+  neither, so boot0 keeps the simulator's stock preloader and the RPMB keeps
+  its stock bytes. Anything that reads either reads something a real unlocked
+  Dot would not show. It skips every step that gets to TWRP on a Dot, the
+  bootrom and the fastbrick included, so it proves nothing about reaching
+  TWRP. It is what makes `stock` reach the restore, which otherwise only a
+  full unlock run would get to.
+- `simulator/entries.sh OUT` runs each entry command twice on a fresh Echo,
+  once to act and once to find the state it left, and checks what each run
+  says. It is the grid the entry commands are held to, 34 cases over the
+  three devices: `fastboot` and `twrp` from an amonet TWRP, from stock
+  fastboot and from a stock boot; `twrp` from an amonet fastboot; `twrp
+  --force` from the
+  locked fastboot it fastbricks; `bootrom --force` from an amonet TWRP, from
+  an amonet fastboot, from the locked fastboot that refuses it and from the
+  stock boot that has no way in; `reboot` from an amonet TWRP, from either
+  fastboot, from a held bootrom and from a stock boot; and `short` from no
+  light. The second run of each is the no-op: `fastboot` and `twrp` report the
+  state they are in, `bootrom` and `short` report a hold they join, `reboot`
+  reports the firmware it finds running, or the bootrom it cannot leave, and
+  `twrp --force` writes no second fastbrick. A donut's 11 add `twrp --force`
+  from stock fastboot, which reaches TWRP through its bootrom, and the
+  refusals it alone meets: `bootrom --force`, which has no bootrom chain, and
+  `short`, which amonet does not unlock. It found the one that did not
+  hold: `short` asked for the short again on a bootrom already held, with the
+  case open and a wire in hand for nothing.
+- `DEVICE=biscuit`, the default, makes an Echo Dot (2nd Generation).
+  `DEVICE=radar` makes an Echo (2nd Generation): adb and fastboot name radar,
+  and the stock LK, the model and the USB ids are radar's. firebreak names the
+  device off its fastboot product and refuses a target that is not for it.
+  `unlock` and `stock` both run the whole way for either device, `unlock` from
+  stock fastboot or `START=no-light` and `stock` from `START=twrp`. A radar
+  unlock takes amonet-radar v1.0.1's archive and its own fastbrick map, which
+  the simulated radar checks the flashed payload against.
+- `DEVICE=donut` makes an Echo Dot (3rd Generation), and `START=stock-booted`
+  is the start its unlock is for. Its table is the 16 partitions read from a
+  stock donut's own GPT, `swdl` where the others have `recovery`, on a
+  7,634,944-sector disk, with boot areas of 4 MiB. Its stock `lk_a`, `lk_b`,
+  `tee1` and `tee2` hold the kit's `lk-donut.bin` and `tee-donut.bin`, because
+  on hardware the kit's images are the donut's own stock bytes, and boot1
+  opens with an IDME that names `A32DOYMUN6DTXA`. It reads as unlocked when
+  `expdb` holds the kit's kaeru, and `fastboot flash recovery` writes `swdl`,
+  as kaeru's fastboot does. Those runs match the hardware ones in steps and
+  skips: the unlock from stock took 12 steps with the TEE and the bootloader
+  skipped, `--factory-reset` took 14, and the restore from TWRP took 15 with
+  the same five skips.
+- A donut's `adb reboot recovery` from TWRP starts Fire OS, not TWRP, as it
+  did on hardware once, on 2026-11-08, between the two slot installs of an
+  `unlock --factory-reset`. From Fire OS it starts TWRP, as it did on
+  2026-11-03 and 2026-11-10. kaeru's `fastboot reboot-recovery` starts the
+  TWRP in `swdl` from fastboot.
+- `backup` and `restore` run on all three devices. A backup taken from one
+  simulated Echo restores onto another of the same device, since the CID and
+  serial are fixed. Run on one Echo each on 2026-11-10, `backup` from TWRP,
+  then a change, then `restore` and `reboot`, each finished: a biscuit after
+  `stock 5.5.5.4`, writing 11 areas; a radar after `stock 4315`, through the
+  fastbrick; a donut after `unlock fireos6 --factory-reset`, writing both
+  system slots, cache, userdata and boot0; and a donut after `stock 8344`,
+  which locks it, through its bootrom. Each kept the Echo's own boot count.
+- A donut needs no short. `run.sh` holds its action button when firebreak asks
+  for the bootrom: `dot.py plug` restarts it into the bootrom whatever it was
+  doing, which is what the hold does on hardware.
+- `dot.py unplug` takes the Echo's power away and leaves it dark, and
+  `dot.py cycle` gives it back with no button held. A `restore` that starts
+  with nothing on USB, cycled once it says it waits for the Echo, reaches a
+  donut with boot0's header cleared in its bootrom with nothing named: before
+  the backup named the bootrom's Echo, that run stopped with "cannot tell
+  which Echo this is", as it did on hardware on 2026-11-12, and after it the
+  run restores. Zero boot0's first 4096 bytes from TWRP first, as
+  `twrp.CLEAR_BOOT0` does: `EMMC_BOOT` and zeros still boots. Run firebreak
+  from its own checkout: `python -m firebreak` finds the working directory's
+  `firebreak` before `PYTHONPATH`.
+- `FIREBREAK_SIM_ELEVATES` picks the attack. `1` takes mtkclient's trigger,
+  which firebreak sends on macOS, and `0` takes the kit's overflow, which it
+  sends on Linux and Windows. Unset, firebreak picks by the host, as it does on
+  hardware. So one host runs both.
+- `report` and `write-test` take any start, because `run.sh` passes the target
+  through as a command. `write-test` takes the bootrom route where the Echo
+  reads as a bootrom, so `short` first is the way here to reach the
+  bootrom write test. Both commands return before a target is chosen.
+- `START=no-light` takes either device. `bootrom.py` reads its payloads from
+  the biscuit archives, and that is enough for a radar because every archive
+  ships the same one: `brom-payload/build/payload.bin` is 20060 bytes and byte
+  for byte the same in amonet-biscuit v2.0.0, v2.0.1 and amonet-radar v1.0.1.
+  A radar started this way needs `--device radar`, because a Dot with no light
+  answers neither adb nor fastboot, so nothing names it.
+- `run.sh` passes `--no-update-check`, so a run never asks PyPI for a newer
+  firebreak. firebreak's stdin is `/dev/null`. Its stdout must be unbuffered: without
+  `PYTHONUNBUFFERED=1`, the prompt reached the log only at exit, and the Dot
+  was never plugged in.
+- `run.sh` stops if `adb` or `fastboot` on its PATH is not the simulator's, or
+  if the virtualenv's port hook is not loaded.
+- `simulator/bin/adb` and `simulator/bin/fastboot` run `dot.py` under the virtualenv's
+  interpreter, and fail when there is none. Through pyenv's shim, `python3`
+  took 270 ms to start against 14 ms, and a run makes up to about 260 calls.
+- After firebreak exits, `run.sh` runs `dot.py halt` before it copies the
+  trace. `halt` sends the bootrom SIGTERM, which writes its open range, and
+  waits up to 10 s for it to exit. It signals the pid only when that process
+  runs this checkout's `bootrom.py` for this state folder. Otherwise it drops
+  the pid. The bootrom clears its pid from the state on every exit.
+- `create` destroys the Dot that the state names before it makes a new one.
+  `destroy` halts too, then takes the state's lock. It stops a bootrom that
+  started after the halt, sets each of the Dot's loop devices writable,
+  detaches it, and removes the container. It skips a loop whose backing
+  inode, offset or size is no longer the Dot's.
+- A stopped container cannot run the detach, and its loops stay bound to the
+  deleted disk files. So `destroy` starts a stopped container first. If the
+  detach still fails, it copies the loop records out and runs the detach in a
+  new privileged container of the same image, with the same checks. If that
+  fails too, or the container is gone, it prints a warning with the records.
+
+## What runs for real
+
+- The eMMC is files in a privileged container: the user area, boot0, boot1
+  and the RPMB. `sim-boot` makes a loop device for each table entry at each
+  boot.
+- The container has no network (`--network none`). firebreak itself runs on
+  the host and keeps its network.
+- The container is privileged. So it sees the Docker VM's devices under
+  Docker Desktop, and the host's devices on a Linux host. At each boot
+  `sim-boot` removes every block node from the container's `/dev` and then
+  makes nodes for its own loops only. `/dev` is the container's tmpfs, so
+  this removes nothing on the host. It takes loop numbers from
+  `/dev/loop-control`, so any number of Dots can run.
+- At each boot `sim-boot` kills every process that the previous boot's
+  commands left running, a leftover `sleep infinity` too. A Dot does not keep
+  writing across a reboot. It spares pid 1, its oldest child (the container's
+  command) and `sim-boot`, by pid. It spares the loop holder only while that
+  pid runs `sim-hold` for this run folder.
+- Every `adb shell` and `exec-out` command runs in the container as the uid
+  and gid that the Dot's adbd gives it, under that environment's `sh`. Its
+  `PATH` holds only that environment's commands. No GNU tool is on it, except
+  bash where TWRP ships bash.
+
+| environment | `sh` | commands | uid |
+| --- | --- | --- | --- |
+| TWRP 3.2.3 | busybox | busybox; `gunzip`, `gzip` and `unpigz` are pigz | 0 |
+| TWRP 3.7.0_9-0, 3.7.0_9-bboe2 | mksh | toybox; `dd`, `grep`, `awk`, `unzip`, `bash` and `unpigz` are their own | 0 |
+| Fire OS 5 | mksh | toolbox's names, `busybox`, `gzip`; no `md5sum` or `wc` by name; `su` under Magisk only | 2000 |
+| Fire OS 6, root adb | mksh | toybox; `dd`, `ps`, `top` are toolbox's; `grep` and `gzip` are their own; no `gunzip` | 0 |
+
+- Each list is read from the image. TWRP's is each ramdisk's `/sbin`. Fire OS
+  5's is `/system/bin` of the image that the Fire OS 5 routes write
+  (`system-6ababc517529`). Fire OS 6's is `/system/bin` of stock 8146.
+- Every `/sbin` name that a TWRP list leaves out is in
+  `/sim/flavours/*.missing`, as is every name that a Fire OS list maps to
+  toolbox or toybox and the simulator does not have. Other Fire OS programs
+  that no tool calls, such as `am`, `logcat` and `svc`, are not listed.
+- Fire OS 5 has no toybox. Its `/system/bin/busybox` is BusyBox v1.22.1,
+  static, with 354 applets, and no name links to it. So `md5sum`, `wc`,
+  `gunzip` and `zcat` work only as `busybox md5sum` and so on.
+- The builds are the closest that run in the container, not the Dot's
+  binaries:
+
+| on the Dot | in the simulator |
+| --- | --- |
+| busybox 1.22.1, bionic | busybox 1.22.1, glibc, `defconfig` |
+| pigz 2.2.5 | pigz 2.2.5 |
+| toybox 0.7.6, Android's config | toybox 0.7.6, `defconfig` with `dd`, `gzip`, `gunzip`, `zcat`, `tr` and `expr`, on zlib |
+| mksh, Android's | mksh R59c |
+| toolbox's `dd`, and 3.7.0's own | `toolbox-dd`: refuses `conv=` with `dd: conv option disabled`, else runs toybox `dd` |
+| 3.7.0's and Fire OS 6's own `grep` | toybox `grep` |
+| 3.7.0's own `awk` | original-awk 2023-11-27 |
+| 3.7.0's own `unzip` | Info-ZIP unzip 6.0 |
+| Fire OS 5's busybox 1.22.1, static | the busybox above: the 354 applet names match |
+| Fire OS 5's and 6's `gzip` (zlib's `minigzip`) | `minigzip` from zlib 1.2.8 |
+| Fire OS 5's toolbox, Fire OS 6's `ps` and `top` | toybox 0.7.6 under toolbox's names |
+| toolbox `md5` and `hd` | `simulator/device/toolbox`: AOSP 5.1's `md5.c` and `hd.c` in Python |
+| toolbox `start`, `stop` and `log` | no-ops that exit 0 |
+| toolbox `getevent` | waits for ever: there is no input device |
+| `sgdisk`, `mke2fs`, `e2fsck`, `resize2fs`, `tune2fs` | gdisk 1.0.10, e2fsprogs 1.47.0 |
+
+- The base image is `ubuntu:24.04` pinned by digest. The image build gets
+  these packages, not pinned: cpio 2.15+dfsg-1ubuntu2.1, e2fsprogs
+  1.47.0-2.4~exp1ubuntu4.1, gdisk 1.0.10-1build1, mksh 59c-37, original-awk
+  2023-11-27-1, python3 3.12.3-0ubuntu2.1, python3-fusepy 3.0.1-5, unzip
+  6.0-28ubuntu4.1 and util-linux 2.39.3-9ubuntu6.6, as built on 2026-10-11.
+- `minigzip -d` passes input with no gzip magic through, as zlib's `gzread`
+  does, and exits 0.
+
+- Names that a ramdisk links but the simulator's build lacks are left out.
+  The image lists them in `/sim/flavours/*.missing`: mostly SELinux commands,
+  `test` and `[` outside the shell, `tar`, `diff`, `stty` and the SHA-2 sums.
+- toybox 0.7.6's `gunzip` passes input with no gzip magic through, as `cat`
+  does, and exits 0. A stream cut short exits 1 with `gzclose: Illegal
+  seek`. pigz 2.2.5 refuses input with no magic, `not compressed --
+  skipping`, and exits 2.
+- toybox `dd` truncates its output at `seek`, and a block device answers
+  `ftruncate: Invalid argument`. toolbox's `dd` writes a block device whole,
+  as overdub's rooting.md measured. So `toolbox-dd` adds `conv=notrunc` when
+  the output is a block device.
+- glibc's `realpath` fails on a missing last component, so busybox
+  `readlink -f` prints nothing for it. Bionic's prints the path, which
+  `fix-symlinks.sh` relies on. The simulator models that script's result
+  rather than running it.
+- `/data/local/tmp` is `root:shell` `0771` under Fire OS 5, as overdub's
+  pitfalls measured. A push there lands `0666`. Elsewhere a push lands as
+  the container's `umask` leaves it.
+- Device nodes are `root` `0600`, so uid 2000 can neither read nor write
+  them. `/proc/sys/vm/drop_caches` and `force_ro` refuse uid 2000 too. These
+  modes are Linux's and Android's defaults, not read from a Dot.
+- Each boot is decided from the disk: the preloader in boot0, the LK in
+  `lk_a`, the TWRP in `recovery`, the markers in `expdb` and `misc`, the build
+  in `system_X`, and Magisk in `userdata`.
+- A boot names the LK in `lk_a` by its md5: amonet v1.1.0's, amonet v2's, the
+  simulator's own stock blob, or any `stock-<device>-*/lk.img` that a restore
+  has extracted from an OTA. An LK that matches both an unlock's image and a
+  stock one reads as the unlock's only while `tee1` holds that unlock's TEE
+  payload, and as stock otherwise, as on hardware, where the payload is what
+  unlocks it: amonet-radar's `lk.bin` is radar 5.5.5.4's own LK, which the
+  OTA pads with zeros to a whole 4 KiB, so an extracted 5.5.5.4 LK matches
+  `lk_a` both after the fastbrick and after `stock 5.5.5.4`. Each of the last
+  two reads as stock, and a stock
+  LK reports the one `lk_build_desc` the simulator holds for the device,
+  whatever build the image came from. An LK it cannot name does not boot. A
+  restore extracts the OTA's LK before it writes it, so the Dot it leaves
+  boots. A cache from before the folder named its device holds `stock-<build>`
+  instead, which that glob does not match, so a Dot carrying an LK from one of
+  those does not boot: clear the simulator's cache, or restore once more.
+- The build comes from `build.prop` at the root of `system_X`, where Fire
+  OS 5 keeps it, or from `system/build.prop`, where Fire OS 6's
+  system-as-root image keeps it.
+- `ro.adb.secure` comes from where an Echo keeps it: on Fire OS 6 the
+  booted slot's `/default.prop`, on Fire OS 5 the `default.prop` in the
+  ramdisk of the boot image in `boot_X_x` or `boot_X`. It reads 0 when
+  neither sets it. Nothing models a refused key: adb lets every key in.
+- A new Echo holds its stock build in both `system_a` and `system_b`, as every
+  Echo backed up here does. The `unlock fireos6` check that `otad` is off
+  reads a slot it cannot mount as one it could not block, so an unformatted
+  `system_b` stops that run.
+
+## What is modelled
+
+- `adb`, `fastboot`, `getprop`, `setprop`, `su`, `id` under Fire OS, `bcbtool`,
+  `pm`, `dumpsys`, `getenforce` and `reboot` are stubs. `twrp install` writes a
+  Fire OS 6 build for an OTA zip and marks root adb for any other zip.
+- `su` is a setuid binary. It gives root only while Magisk's database is in
+  `userdata`, and Fire OS 5 has it on `PATH` only then. Magisk's busybox is not
+  put first on `PATH` under `su`.
+- `su` reads its words with `getopt_long`, the options and the option string
+  of Magisk 17.3's `native/jni/su/su.c` (tag `v17.3`). As there, getopt moves
+  the words that are not options to the end. `-c` takes the command from the
+  word before `optind`, so `su 0 -c id x` runs `id x` and `su -cid` runs
+  `-cid`. The first word left after the options, and after a `-`, is the
+  user. So `su 0 -c` and `su root -c` set the uid. `-cn` and `-mm` are
+  rewritten to `-z` and `-M`, and `-u` prints the usage and exits 2.
+- Not as Magisk: glibc's `getopt_long`, where Magisk has bionic's; names
+  other than `root`, `system` and `shell` read as a number, where bionic
+  knows every Android id; and `-s`, `-l`, `-p` and `-M` change nothing. Its
+  own PTY, which Magisk opens when stdin is a terminal, is not modelled. It
+  exits with the command's status.
+- Under uid 2000, `setprop` sets only `debug.*`, `log.*`,
+  `service.adb.root`, `service.adb.tcp.port` and `sys.powerctl`, which AOSP
+  5.1 lets the shell set. Any other name is ignored and `setprop` exits 0. A
+  set `ro.` name does not change. `sys.powerctl` set to `reboot,X` reboots
+  into X.
+- `reboot` sets `sys.powerctl`, as 5.1's `reboot` does, so the shell can
+  reboot. It returns at once, where 5.1's waits for the reboot.
+- `/sdcard` and `/data/local/tmp` are container folders. They have no size
+  limit, and a format of `userdata` does not empty them. `/sdcard` is `0777`:
+  its FUSE modes are not modelled.
+- boot0 holds a preloader when it starts `EMMC_BOOT` and holds `BRLYT` at
+  0x200. Otherwise the Dot boots into the bootrom. So amonet v1.1.0's
+  `EMMC_BOOT` and zeros, and firebreak's zeros, both reach it. Nothing else in
+  boot0 is checked: not the preloader's own header or its signature, and not
+  boot1.
+- `lk_b`, `tee1` and `tee2` take no part in a boot. Only `lk_a` decides the
+  LK.
+- The fastbrick writes amonet v2.0.0's chain directly. It runs no exploit.
+- An LK clears `FASTBOOT_PLEASE` when it acts on it: amonet v1.1.0's in
+  `expdb`, amonet v2's in `misc`. This is inferred: each release's
+  `fastboot-step.sh` reaches TWRP with the marker still written, so the marker
+  cannot hold the Dot in fastboot.
+
+### boot0 and boot1
+
+- Their loop devices are read-only from the start of each boot, and again
+  after each `fastboot flash` or `erase` of them.
+- `/sys/block/mmcblk0bootN` is a FUSE file system with `force_ro` and `size`,
+  over a tmpfs. A boot fails unless the FUSE file system is the top mount
+  there. So a write cannot reach a Linux host's own `/sys/block`.
+- A write to `force_ro` sets the loop device read-only or writable before it
+  returns. So `echo 0` and `echo 1` hold for any writer: `dd`, `toybox dd`, or
+  a shell redirect.
+- The value is read as the Dot's kernel, Linux 3.18.19, reads it: with
+  `simple_strtoul` in base 0. A number other than 0 sets read-only, and text
+  with no number first is `EINVAL`. So `1_0` sets read-only, and `-1` and a
+  space before `1` are `EINVAL`. Later kernels use `kstrtoul`, which refuses
+  `1_0`.
+- A read gives the loop device's flag. So after a direct `blockdev --setrw`
+  it reads 0.
+- Only root can write `force_ro`.
+- `/sys/block/mmcblk0/device/cid` reads one fixed CID, the same on every
+  simulated Echo and every run, so `restore` takes a backup from one
+  simulated Echo onto another of the same device. A real CID is the eMMC's
+  own and differs between Echoes.
+- boot1 opens with an IDME that holds a `bootcount` field, laid out as the
+  hardware's: the name in 16 bytes, then its size, 8, and the value in
+  decimal digits from byte 28. Every boot that ends in fastboot, TWRP or Fire
+  OS raises it by one. A held bootrom, a Dot with no LK, and a boot the LK
+  refuses do not, though on hardware the LK may count that last one too. So
+  a backup's count falls behind the Echo's, and `restore` has a newer count
+  to carry over. A donut's IDME also names its `device_type_id`.
+
+### TWRP
+
+- Each TWRP replaces its by-name bootloader nodes at boot, as the script in
+  its ramdisk does. A write through one does not reach the disk.
+- 3.2.3 (`/sbin/fix-symlinks.sh`): `lk_a`, `lk_b`, `tee1` and `tee2` are
+  `/dev/null`, and `X_real` names the partition. `boot_a` and `boot_b` name
+  `boot_a_x` and `boot_b_x`, and `boot_X_amonet` names amonet's. With no
+  `boot_X_x`, `boot_X` is a link to the missing `by-name/boot_X_x`.
+- 3.7.0_9-0 and 3.7.0_9-bboe2 (`/sbin/slot-symlinks.sh`): `lk_a`, `lk_b`,
+  `tee1`, `tee2`, `tee` and `preloader` are files in `/tmp/ota-decoy`, at
+  1, 1, 5, 5, 5 and 4 MiB. `X_real` names each one that was a partition.
+- `/tmp/ota-decoy` is a 64 MiB tmpfs, so a `dd` with no `count` there stops.
+- bboe2 also points `boot_a` and `boot_b` at `boot_a_x` and `boot_b_x` when
+  they exist, and keeps amonet's as `boot_X_amonet`.
+- Not modelled: `/dev/block/other-lk`, `other-system` and `other-boot`,
+  `/dev/block/current-boot` and `current-system`, `/dev/block/bootdevice`,
+  `/dev/block/by-name` and `/dev/block/platform/bootdevice`. A command that
+  names one finds nothing.
+- adb answers 5 s before MTP is on. Until then `sys.usb.config` is `adb` and
+  `ro.twrp.version` is not set. The 5 s is from the ring's timing in
+  unlocking.md.
+- The switch to `mtp,adb` drops USB for 1 s. A call made then fails with
+  adb's error text, and `adb devices` lists nothing. A shell call running
+  across the switch runs to its end, prints the first half of its output
+  and exits 255, or 0 without the shell protocol. A push fails with `failed
+  to read copy response: EOF`.
+  The trace marks each one `# cut by the USB switch`. None of this is
+  measured: not the 1 s, the command running on, the half, the status or the
+  text.
+
+### adb
+
+- The `adbd` of TWRP 3.2.3 (5.1.1, `LMY49M`) and of Fire OS 5.5.5.4 (from
+  its OTA's `boot.img`) list no `shell_v2` feature and hold
+  `create_subproc_pty`. The `adbd` of both 3.7.0 TWRPs and of Fire OS 6 list
+  `shell_v2`. Each was read from its image.
+- So under 3.2.3 and Fire OS 5, adb has no shell protocol. adb 37's client
+  (`client/commandline.cpp`) then:
+  - exits 0 from `adb shell` whatever the command did, and 1 only when it
+    cannot connect;
+  - never tells the Dot that stdin ended, so a command that reads stdin to
+    its end never ends;
+  - refuses a service string over 4096 bytes with `error: shell command too
+    long`, and `-T` with `error: device only supports allocating a pty`.
+- 5.1's `adbd` (`adb/services.c`) runs a `shell:` command on a PTY, which it
+  leaves in the kernel's default mode, and an `exec:` command on a socket
+  pair. So the output has CR LF, and the line discipline acts on stdin: it
+  echoes it, edits lines, and sends `SIGINT`, `SIGQUIT` and `SIGTSTP` for
+  0x03, 0x1c and 0x1a. `sim-pty` runs the command so, on a PTY in the
+  container with the container kernel's default mode.
+- That PTY is the container's kernel, Linux 6.x, not the Dot's 3.18.19. It
+  passes all output that the command wrote before the PTY closes. The Dot's
+  3.18 kernel and Lollipop's `adbd` can lose the tail of the output. The
+  simulator never loses it, and models no such loss.
+- When the host's `adb` exits, `sim-pty` hangs the PTY up, as `adbd` does
+  when it closes the PTY. That `adbd` closes it then is inferred.
+- `exec-out` exits 0 in every environment: the client never reads a status.
+  The command's stdin never ends there either.
+- With the shell protocol, under 3.7.0_9-0, bboe2 and Fire OS 6, `adb shell`
+  passes the status, as overdub's rooting.md measured for 3.7.0. `-n` ends
+  the command's stdin at once. Otherwise the shim passes stdin and then ends
+  it.
+- adb's own options are read only before the command, as adb's `getopt`
+  with `+` does: `adb shell ls -t` runs `ls -t`.
+- `adb pull` copies a file or a block device whole, as the user the session
+  runs as, to the current folder when no local path is given. It writes
+  beside the local path first and moves the copy into place only once it is
+  whole, so a failed pull leaves an existing file alone, as adb does. Any
+  failure to read reads as a missing source. A Dot that restarts during the
+  copy cuts it, as `push` is cut, and leaves no partial file.
+- 3.2.3's `__bionic_open_tzdata` lines are not modelled. Nor is what `-x`
+  makes a protocol `adbd` do.
+
+### fastboot
+
+- `devices` and `--version` answer whatever mode the Echo is in, and every
+  other verb waits for it to reach fastboot. Both are about the host rather
+  than the Echo: `report` and `write-test` read the version in their host
+  block, before they look at an Echo at all, and an Echo that shows no light
+  never reaches fastboot. Without that, `--version` fell into the wait and the
+  run stopped on firebreak's own 30 second tool timeout.
+- A locked LK refuses `flash` and `erase` with `the command you input is
+  restricted on locked hw`, which a locked v1.1.0 LK printed.
+- `flash` of an image larger than its partition fails with `size too large`.
+  `flash` or `erase` of a name that is not in the table, nor boot0 or boot1,
+  fails with `unknown partition`. Neither text is measured.
+- `-S` sets the size above which `flash` reports `Sending sparse`, with the
+  count of pieces. The write is the same either way. Without `-S` an image is
+  sent whole.
+- `oem reboot-recovery` reboots into recovery on amonet v1.1.0's LK, which is
+  the only LK measured to take it, and fails on any other. A Dot unlocked with
+  amonet v2, on `63cb91b-20221007_072309`, refused it with
+  `FAILED (remote: 'unknown command')` and `fastboot: error: Command failed`,
+  which is what this prints.
+- `reboot-recovery` and `reboot bootloader` reboot on any LK here, and a
+  `reboot-` spelling means the spaced one, as fastboot takes either. Each
+  spelling is measured on one Echo: the hyphenated one on a Dot unlocked with
+  amonet v2, on `63cb91b-20221007_072309`, where it answered
+  `Rebooting into recovery OKAY`, and the spaced one on a radar, on
+  `63cb91b-20221007_073612`, where it answered `OKAY` in 0.076 s.
+
+### The bootrom
+
+- The bootrom is `simulator/bootrom.py`, on a pseudo-terminal, started at the boot
+  into the bootrom. It runs no code. It answers the handshake, `0xd1`,
+  `0xd4`, `0xc8` and `0xfd`, which reports `0x8163` for a biscuit and a radar
+  and `0x8167` for a donut, with status `0x0000`, as measurements.md read.
+- Waiting for the handshake, it answers any other byte with that byte plus
+  one, as a real bootrom does, so `0xf0` comes back as `0xf1`. That is what a
+  run's probe reads to tell a bare bootrom from a payload holding one. Until
+  it did, the simulated bootrom stayed silent and every probe took the answer
+  for a payload's, then spent the 5 second read timeout on a block that never
+  came: 25 s against 19 s on the payload step of a `bootrom --force`, in the
+  simulator's own clock.
+- The crypto engine at `0x10210000` answers function 126 only after the
+  acquire words, with length 1 and slot pointers 18, 26, 26. It then writes
+  the input words XOR the zero decryption to the destination.
+- Before `0x102868` holds the range-check pattern, word access below
+  `0x10000000` is refused. So a payload upload or a jump without the defeat
+  fails.
+- A write to `0x1028A8` jumps. The bootrom compares the memory at `0x201000`
+  with the `payload.bin` of each amonet zip. It answers as the payload that
+  matches, and stays silent for any other code.
+
+### A donut's bootrom
+
+- A donut's bootrom also answers `0xda` and `0xe0`, and the control transfers
+  that arrive on its second pseudo-terminal. It stalls every transfer it does
+  not model, with `[Errno 32] Pipe error`.
+- The kit's overflow: `SET_LINE_CODING` on interface 0 keeps its first 7
+  bytes as the line coding, and the word after the eighth byte as a pointer.
+  `GET_LINE_CODING` returns the line coding. `GET_DESCRIPTOR` for the
+  configuration walks that pointer. An `0xda` access goes through only when the
+  six pointers firebreak walks, `0xd7a8` to `0xd7aa` and `0xd7b1` to `0xd7b3`,
+  were all walked since the last access, and is refused with `0x1d0c` otherwise.
+  The kit walks before every access, so the simulator asks for that, but which
+  walks a real bootrom needs, and whether an access spends them, is not
+  measured.
+- `0xda` adds `0x40` to the address it is given, as firebreak's offsets
+  assume. `0xd2e4` holds the send routine's address, `0x102c40`, which the
+  simulator invents. A write of a word to that address plus 8 jumps to the
+  word, with no end status.
+- mtkclient's trigger: `0xe0` keeps the payload it is sent. The control
+  transfer `0xa1` to `wIndex` `0xcc` jumps to that payload at `0x100a00` once
+  `0x10007050` holds that address byte-reversed and all 15 reads of the ladder
+  have ended on that word. Otherwise it stalls, and so does a second trigger
+  once the payload has jumped.
+- A jump to `0x100a00` compares the memory there with the kit's `stage1.bin`.
+  Stage 1 answers `0xa1a2a3a4`, takes `0x4000` and `0x4001`, and starts stage
+  2 only when what it was given is the kit's `stage2.bin`. Stage 2 answers
+  `0xb1b2b3b4` and speaks the payload's protocol below, with the nine commands
+  firebreak's donut client sends.
+- `0x6000` sets the fastboot flag, in the payload and not in flash, as on
+  hardware. The `0x3000` after it restarts into fastboot.
+- A donut's bootrom that no handshake reaches in 40 seconds is taken by its
+  watchdog. The donut then shows nothing for 39 seconds and boots again, which
+  with boot0's header cleared is the bootrom again, over and over, as one did
+  on 2026-11-12. The handshake stops the watchdog. Both times run on the
+  simulator's clock.
+
+### The payload
+
+- The payload speaks its own command set: v1.1.0's six commands, or the
+  twelve that v2.0.0's client sends.
+- `0x5002` sends v2.0.0's 512-byte test pattern, so its client's fast-send
+  check passes. `0x5003` answers the acknowledgement.
+- Block commands go to the disk files through `sim-emmc` in the container.
+  The RPMB is the first 256 bytes of its file. A new Dot's RPMB starts
+  `AMZN`.
+- `0x1003` and `0x1004` take 1 to 64 blocks, as amonet's client allows. A
+  count outside that, a read or write past the end of its area, or any
+  access to an area other than 0, 1 and 2 halts the payload: it logs
+  `halted` and answers nothing more. What the real payload does there is not
+  known.
+- `0x5000` reads any address at any length. Whether the real payload bounds
+  either is not known.
+- The `0x3000` reboot hands the Dot back to the boot rules, 3 s later.
+- The port is not modelled: the short, the watchdog and USB packet sizes do
+  not exist here, and the preloader offers no `0e8d:2000` serial port.
+- `ports.py` also replaces `firebreak.identify.usb_devices`, so a run never
+  sees the host's own USB devices. It lists the simulated Dot as `AEOBC`
+  when it is booted, adb `unauthorized` too, as `Echo Dot (2nd Gen)` in TWRP
+  3.7.0 and as `Echo Dot 2nd Gen` in TWRP 3.2.3, as `0e8d:0003` with no
+  strings in its bootrom, as `0e8d:2000` `MediaTek` `MT65xx Preloader` in the
+  `preloader` mode, and lists nothing in any other mode. A donut is `AEODN`
+  when it is booted, and `Echo Dot (3rd Gen)` in its TWRP. Neither its ids
+  nor its TWRP's strings are read from one: firebreak names it by
+  `ro.product.device` and its hardware code. The two download ids
+  are what firebreak reads the bootrom and preloader states from, so without
+  them a run in either state read nothing on USB at all.
+- A Dot whose boot0 holds a preloader, and whose `lk_a` holds no LK this
+  simulator knows, is in the `preloader` mode: the preloader runs and chains
+  nothing, which is the Dot that shows no light. adb and fastboot answer
+  nothing there, as in any mode but their own.
+
+### Leniencies
+
+The simulator accepts these, where a real Dot may not:
+
+- a bootrom that answers for ever, where a Dot's own watchdog takes it after
+  about 40 seconds
+- a preloader that stays on USB, where a stuck Dot's shows for about a second
+  every 30
+- a jump without the cache-disable command (`0xC8 0xB1`)
+- a crypto engine that ignores SOURCE and does not need the key and IV slots
+  cleared
+- root on Fire OS 5 decided by `magisk.db` alone
+- amonet v2.0.0's LK reading unlocked whatever the TEE holds
+- any LK but stock booting any known TWRP
+- the fastbrick on an unlocked LK
+- the fastbrick leaving boot0 as it was; the real one writes the preloader
+- `-s` and `ANDROID_SERIAL`, which it records and ignores
+- `dd` past 2 GiB of `mmcblk0` under bboe2 and 3.7.0_9-0, where the Dot's
+  `dd` answers `EINVAL`
+- a donut's ladder read answering status `0x0000`, where the first one
+  answers `0x0003` on hardware
+- a donut's trigger with no `sudo`: `authorize` answers yes and asks nothing,
+  though the run still prints the sudo note on macOS
+- a donut's TWRP with no decoy nodes, which no reading has looked for
+
+## The port
+
+- `dot.py create` makes a virtualenv in `~/.cache/firebreak-sim/venv` and
+  installs firebreak's pinned dependencies there with `uv`. Without pyserial
+  there, every run that reached a bootrom stopped with `No module named
+  'serial'`, and only the runs that never left fastboot passed. A
+  `.pth` file there imports `ports.py` at every start, so the children that a
+  tool starts with `sys.executable` see the port too, whatever their
+  `PYTHONPATH`.
+- `ports.py` replaces `serial.tools.list_ports.comports` when pyserial loads.
+  It lists only the simulated bootrom, `0e8d:0003`, and only while the Dot is
+  in its bootrom. It never lists a real port.
+- Listing the ports also settles a reboot that has come due, by running
+  `dot.py status`, which loads the state and settles it. While firebreak waits
+  for the bootrom it polls only the ports, so without that nothing runs the
+  Dot's clock on: the state keeps `mode` `none` with `booting` set, and the
+  bootrom never starts. `create` records the simulator's own directory in the
+  state for the hook to find `dot.py` with.
+- It settles only once the reboot is due, not on each listing. A `dot.py
+  status` holds the clock at real time for as long as it takes to start, so
+  settling on every poll spends the speed on starting Python. It takes a
+  timeout as well, and reports a child that fails, because a listing could not
+  block before this and now can.
+- The bootrom keeps the pseudo-terminal's other end open, so a tool can close
+  and reopen the port.
+- `ports.py` also replaces `open_bootrom`, `trigger` and `authorize` in
+  `firebreak.mediatek.libusb`, and `ELEVATES` when `FIREBREAK_SIM_ELEVATES`
+  is set. `open_bootrom` hands back the bootrom's pseudo-terminal in an object
+  of `Usb`'s shape, with its control transfers sent as JSON lines on the
+  second pseudo-terminal. So a donut is named over the serial port and then
+  driven through that object on the same handshake, as on hardware. `trigger`
+  sends its transfer the same way and answers an empty string, as the real
+  one does through `sudo`, which swallows the transfer's error. It raises
+  `NotThereError` when the Echo is not in its bootrom, as `found` does.
+- The bootrom serves a control transfer while it waits for its next byte, so
+  a trigger can start stage 1 while the data stream is idle. The wait for a
+  reply is real time, 5 s: on the fast clock it was 0.25 s at the default
+  speed, short enough for a slow reply to be read by the next transfer.
+
+## The clock
+
+- `FIREBREAK_SIM_SPEED` sets the speed, K. `run.sh` sets 20 when it is not
+  set. At 1 or less the hook changes nothing.
+- The hook replaces `time.monotonic`, `time.perf_counter`, `time.time`, their
+  `_ns` forms, `time.sleep`, `select.select` and the `select` method of each
+  `selectors` class. It does this in every process the virtualenv's
+  interpreter starts: the tool, its children, `dot.py` and `bootrom.py`.
+  `run.sh` runs `plug`, `halt`, `snapshot` and `table` under that interpreter
+  too.
+- The clock runs K times faster than real time, except while a process holds
+  it. Then it runs at real time in every process. A `dot.py` call holds it
+  from its start to its exit, except while it sleeps. `bootrom.py` holds it
+  for each eMMC access. So work in the container takes real time, and so
+  does a tool timeout that waits for it.
+- `clock.json`, in the state folder, holds the anchor in real and in clock
+  time, the offset to wall time, and the pids that hold the clock. A change
+  replaces the file whole, under `clock.lock`. Each change drops the pids that
+  are gone, so a call that a tool kills holds the clock only until the next
+  change. `create` deletes the file.
+- Each trace line's `time` is the clock's, not real time, except the lines
+  that `create` writes: `run.sh` runs it without the hook.
+- A sleep or a wait for a descriptor sleeps at most 50 ms of real time at
+  once, so a change of speed takes effect within 50 ms.
+- pyserial keeps `time.monotonic` as a class attribute and calls it through
+  `self`. A plain function there gets `self` as an argument, so the clock's
+  functions are bound methods.
+- `ports.py` takes its `REAL_` names from `time` and `select` as it is read,
+  before the lines at its end install the clock. So they are the real
+  functions only in the copy the `.pth` imported at that start. Reach them as
+  `firebreak_sim_ports`, which is the name the `.pth` installed that copy
+  under, and never by importing `ports.py` again: a second read takes its
+  `REAL_` names from a `time` the first read already replaced, so they would
+  scale with the speed under a name that says they do not, and its last two
+  lines would add a second finder and a second clock over the first.
+- A wait that must not scale with the speed takes those names. The bootrom's
+  wait for a mode to claim is one: it wanted 10 seconds of the clock, which
+  the speed divides into 0.35 s at 60 and 0.5 s at the default, and a process
+  that has to start Python within that loses.
+- `dot.py` and `bootrom.py` each run under two interpreters, so each imports
+  the hook inside a `try`. The shims run the venv's Python, which has the
+  `.pth`; `run.sh` runs `create` and `destroy` with the plain `python3`, which
+  does not, and a `create` that boots the Dot into its bootrom starts
+  `bootrom.py` from there. Where the name does not resolve nothing replaced
+  `time`, so `time.monotonic_ns` and `time.sleep` are themselves the real
+  clock and the two ways agree.
+
+These stay in real time:
+
+- `Event.wait`, `Lock.acquire` and `Condition.wait` with a timeout. firebreak
+  uses them only for its progress line, every 0.1 s, and for its cache lock,
+  in a loop with no deadline.
+- Socket timeouts. Only downloads use them, and the cache holds every
+  download.
+- `time.strftime` in firebreak's log. It only prints.
+- `run.sh`: `timeout 1500`, and the 0.5 s poll for the short prompt.
+
+Work outside a hold counts K times: the interpreter's start before the hook,
+firebreak's own work, and the pseudo-terminal. With 6 Dots at once a call to
+`adb` or `fastboot` spends about 100 ms there, 2 s at K=20. These timeouts
+bound K:
+
+- firebreak kills `fastboot flash brick` after 8 s, as a Dot needs. At K=20,
+  with 6 Dots at once, the call took 1.6 to 2.8 s to start and the chain 0.8
+  to 1.3 s more. At K=100, 1 of the 3 runs from stock fastboot was killed
+  before the reboot, and at K=200 all 3 were. Each then stopped with "the Dot
+  has been stock-fastboot for 10 minutes".
+- firebreak waits 5 s for a 64-block payload read. At K=100 and at K=200, 1
+  of the 3 runs from no light stopped there, with 25,550 and 26,572 of
+  32,772 bytes.
+- At K=20 all 18 runs rooted, 6 at a time. At K=100, 2 of 6 stopped, and at
+  K=200, 4 of 6.
+
+### Measured
+
+Measured on 2026-10-12, firebreak to each target from no light with the short
+on the target itself, which `firebreak short` took over, and from stock
+fastboot, 6 Dots at once. Each Dot had its own `FIREBREAK_SIM`
+and `FIREBREAK_SIM_CACHE`. A time is from the start of `run.sh` to its
+summary line, and includes `create` and `snapshot`.
+
+| run | K=1 | calls | K=20 | calls | K=20 | calls |
+| --- | --- | --- | --- | --- | --- | --- |
+| v1-bboe, no light | 73 s | 181 | 60 s | 165 | 58 s | 165 |
+| v1, no light | 75 s | 191 | 58 s | 175 | 60 s | 175 |
+| v2, no light | 103 s | 275 | 60 s | 249 | 60 s | 248 |
+| v1-bboe, fastboot | 87 s | 186 | 64 s | 164 | 64 s | 164 |
+| v1, fastboot | 87 s | 186 | 64 s | 164 | 64 s | 164 |
+| v2, fastboot | 63 s | 65 | 30 s | 51 | 28 s | 51 |
+
+- The 6 runs took 103 s at K=1 and 64 s at K=20, both times.
+- A run makes fewer calls at a higher K. A call's start counts K times, so
+  fewer polls fit in a wait.
+- At K=20 and K=100, each run's trace, snapshot and raw table matched the run
+  at K=1, but for the number of polls.
+
+## The trace
+
+- Every `adb` and `fastboot` call, boot and reboot goes to `trace.jsonl`, one
+  locked write per line, with the whole command line, global flags included.
+  Each call goes in when it starts, so a call that a tool kills still shows.
+  A push and a `fastboot flash` carry the file's md5.
+- A shell call that passes stdin adds a second line when it ends, `# stdin
+  sent BYTES:MD5 received BYTES:MD5: COMMAND` in `trace.py`'s output.
+- `sent` counts the bytes that the host's shim wrote into `docker exec`.
+  `received` counts the bytes that arrived in the container. `sim-stdin`
+  counts them there, between `docker exec` and the command's `sh` or
+  `sim-pty`, and passes them on through a pipe. Neither counts what the
+  command read. `received unknown` means `sim-stdin` did not report, as when
+  a reboot killed it.
+- When the command exits before it reads all of its stdin, `received` can be
+  less than `sent`: the rest is still in Docker. When the command reads to
+  its end, a `received` less than `sent` is bytes that Docker lost.
+- The bootrom logs each command with its address and words, and a refused
+  `read32` or `write32` as `refused` with its count. An upload of more than 16
+  words logs its count and md5.
+- The payload logs reads and writes as an area, a first block, a count and
+  the md5 of the bytes. Contiguous reads, or contiguous writes, join into one
+  range. `--commands` shows the commands each range took. It also shows the
+  watchdog kicks and cache reads sent between ranges, as `between ranges`.
+- `trace.py` puts `$CACHE` for the simulator's cache folders and
+  `~/.cache/firebreak`, and `$TMP` for temporary names. It drops `adb
+  devices`, `adb get-state` and `fastboot devices`; `--keep-polls` keeps
+  them.
+- `adb shell -n getprop NAME`, `fastboot getvar NAME` or `adb wait-for-X`,
+  the whole line and nothing more, is not printed again when it is the same
+  as the last line printed. A dropped poll between them does not count, so
+  the number of polls before TWRP is up does not show. Every other line is
+  printed each time, compound commands included, so a command sent twice
+  shows twice.
+
+## Traps
+
+- An empty `bootrom.log` means the bootrom served a payload and said nothing,
+  not that it never started. It writes there only to complain. Reading it the
+  other way round sent one hunt for the cause of a bootrom that never ran well
+  past the three faults that stopped it.
+- `venv` leaves an existing `bin/python` alone, so a pruned or upgraded pyenv
+  version leaves the simulator's own symlink pointing at nothing. `make_venv`
+  passes `--clear` for that: without it, it ran the interpreter it had just
+  failed to find and `create` died with a bare `FileNotFoundError`, for every
+  scenario and not only the ones that reach the bootrom.
+- `dd if=/dev/zero` onto a regular file with no `count` does not stop at the
+  file's end. One filled Docker's disk. The container was gone, but its loop
+  devices still held the deleted file, so the space came back only after a
+  Docker restart.
+- A loop that `losetup` attached and that then fails its backing check, or
+  its `blockdev`, is detached before the boot fails. A loop whose backing
+  inode is not the Dot's is left alone.
+- A loop device's read-only flag outlives `losetup -d`. A loop that was
+  boot1 at one boot came back as `boot_b` at the next and refused every write
+  with `Operation not permitted`. Loop numbers are shared by every container
+  on the host, too. So `sim-boot` sets each loop writable when it attaches
+  it and before it detaches it, and `destroy` does the same.
+- A container removed without `destroy` leaves its loop devices attached in
+  the Docker VM. `losetup -a` in any privileged container lists them.
+- busybox and toybox `umount` free the loop device under what they unmount,
+  where on a Dot `LOOP_CLR_FD` fails on an eMMC partition. Freed, the loop
+  number went to another Dot's partition: one Dot's `sgdisk` then read a
+  768 MiB disk with no table, or a disk of 0 sectors, and one snapshot read
+  `system_a` through `rpmb`. So `sim-hold` keeps every loop open for the boot,
+  and the kernel only marks a busy loop to clear when it closes.
+- `sim-hold` writes to `/sim/run/holder.log`. A boot fails unless it holds
+  every loop. `facts` and `snapshot` fail unless it still runs.
+- FUSE 2 refuses a mount point that is not empty, so `/sys/block` is mounted
+  with `nonempty`.
+- `docker exec -u 2000` runs with gid 0, so a `root:shell` `0771` folder
+  refuses it. The simulator passes `2000:2000`.
+- The ext4 file systems differ on every run. The snapshot compares their file
+  trees, not their bytes.

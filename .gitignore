@@ -1,0 +1,18 @@
+# Local SSH keys
+.ssh/
+
+# Local inventory & secrets (copy from config/devices.example.yaml and hub/.env.example)
+config/devices.yaml
+hub/.env
+
+# Runtime data & media
+hub/data/
+hub/cameras/recordings/
+*.pyc
+__pycache__/
+.venv/
+.DS_Store
+
+# Build outputs
+nodes/echo-dot-gen2/overdub/build/
+hub/airconnect/bin/

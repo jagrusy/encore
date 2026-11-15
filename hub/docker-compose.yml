@@ -1,0 +1,74 @@
+services:
+  music-assistant:
+    image: ghcr.io/music-assistant/server:latest
+    container_name: encore-music-assistant
+    network_mode: host
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - ./data/music-assistant:/data
+    environment:
+      - LOG_LEVEL=info
+
+  airconnect:
+    build:
+      context: ./airconnect
+      dockerfile: Dockerfile
+    container_name: encore-airconnect
+    network_mode: host
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    command: ["-Z", "-l", "1000:2000"]
+
+  go2rtc:
+    image: alexxit/go2rtc:latest
+    container_name: encore-go2rtc
+    network_mode: host
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    devices:
+      - /dev/dri:/dev/dri
+    volumes:
+      - ./cameras:/config
+      - ./data/go2rtc:/data
+    environment:
+      - TZ=${TZ:-America/New_York}
+
+  encore-brain:
+    build:
+      context: ..
+      dockerfile: hub/encore-brain/Dockerfile
+    container_name: encore-brain
+    network_mode: host
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - ../config:/app/config:ro
+      - ./data/brain:/app/data
+    environment:
+      - ENCORE_CONFIG=/app/config/devices.yaml
+      - BRAIN_PORT=${BRAIN_PORT:-8765}
+      - GO2RTC_URL=${GO2RTC_URL:-http://127.0.0.1:1984}
+      - AI_AGENT_ENDPOINT=${AI_AGENT_ENDPOINT:-http://127.0.0.1:8080/v1/chat/completions}
+
+  bt-multi-sink:
+    build:
+      context: ./bt-multi-sink
+      dockerfile: Dockerfile
+    container_name: encore-bt-multi-sink
+    network_mode: host
+    restart: unless-stopped
+    privileged: true
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - ../config:/app/config:ro
+      - /var/run/dbus:/var/run/dbus
+      - /run/user/1000/pulse:/run/user/1000/pulse
+    environment:
+      - ENCORE_CONFIG=/app/config/devices.yaml
+      - PULSE_SERVER=unix:/run/user/1000/pulse/native

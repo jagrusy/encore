@@ -1,0 +1,314 @@
+name: CI
+
+# Both triggers are needed and they must not overlap. A push to a fork raises
+# nothing here, so pull_request is what covers a contributor; pull_request never
+# fires for a tag, so push is what covers a release, and the merge onto main.
+# Unfiltered, the two ran the whole suite twice for every branch that had a pull
+# request open.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+# The default for every job below, and this runs on pull requests from anyone,
+# so the token should not be able to write. The release job raises its own and
+# is reachable from a tag alone.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      # Pinned to commits rather than tags, for the same reason.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+
+      # Both are expected to be silent.
+      - run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      # Vet for the target, not the runner: internal/evdev asserts a 32-bit
+      # timeval and does not compile anywhere else.
+      - run: GOOS=linux GOARCH=arm GOARM=7 go vet ./...
+
+      # Tests run as 32-bit ARM under qemu rather than natively: internal/evdev
+      # asserts a 32-bit timeval, so this tree does not compile for the runner
+      # at all. Running them at the target word size is the point, because
+      # struct input_event is 16 bytes there and 24 here.
+      - run: sudo apt-get update && sudo apt-get install -y qemu-user-static
+      - run: GOOS=linux GOARCH=arm GOARM=7 go test -exec qemu-arm-static ./...
+
+      # The race detector does not support GOARCH=arm, so the run above cannot
+      # use it. These are all the packages that build for the runner, so they
+      # get a second run natively.
+      - run: go test -race ./internal/alexa/ ./internal/audio/ ./internal/esphome/ ./internal/device/ ./internal/mdns/ ./internal/sendspin/ ./internal/untrustedlog/ ./internal/update/
+
+      # build.sh is the only supported build, and it is cgo against OpenSL ES, so
+      # CI needs the NDK to build what ships rather than something adjacent to
+      # it. The runner image already carries one; this only says where.
+      - run: echo "ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+      - run: ./build.sh
+
+      # The shell is half of this repository, so it is linted like the Go.
+      - run: sudo apt-get install -y shellcheck
+      # A rule rather than a list, like the mode check below: a script added in a
+      # directory nobody remembered is still linted.
+      - run: git ls-files -z '*.sh' | xargs -0 bash -n
+      - run: git ls-files -z '*.sh' | xargs -0 shellcheck -S style
+      # A mode is invisible to every other check here: lint, vet, the tests and
+      # shellcheck all read these files rather than exec them. A script that
+      # lost its bit fails for the first person to run the command README.md
+      # gives, and nowhere before that.
+      - name: Scripts are executable
+        run: |
+          bad=$(git ls-files -s -- '*.sh' 'deploy/*.py' | awk '$1 != "100755" { print $4 }')
+          [ -z "$bad" ] || { echo "not executable:"; echo "$bad"; exit 1; }
+
+      # MapDump loads Amazon classes by name, so a mangled one fails on the
+      # device and nowhere earlier: a wrong name is still a valid string
+      # literal, and compiling proves nothing about it. The shape is what can
+      # be checked here.
+      - run: deploy/check-identifiers.sh
+
+      # Build the jar as well. That catches neither a wrong class name nor a
+      # wrong uid, but it does prove MapDump.java still compiles and that its
+      # build.sh still works, and nothing else here covers either.
+      #
+      # The JDK is pinned because the window is narrow: javac dropped -source
+      # 1.7 in JDK 20, and D8 wants 11 or newer.
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6
+        with:
+          distribution: zulu
+          java-version: '17'
+      - uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4
+        with:
+          packages: 'platforms;android-22 build-tools;34.0.0'
+      - name: Build mapdump.jar
+        run: |
+          export ANDROID_JAR="$ANDROID_SDK_ROOT/platforms/android-22/android.jar"
+          export R8_JAR="$ANDROID_SDK_ROOT/build-tools/34.0.0/lib/d8.jar"
+          ls -l "$ANDROID_JAR" "$R8_JAR"
+          deploy/mapdump/build.sh
+
+  # The one test here that does not drive both sides from a single reading of the
+  # spec: it runs a real aiosendspin server against the client. Every other
+  # Sendspin test builds the peer out of the same constants and structs the
+  # daemon uses, so a wire-format mistake agrees with itself and passes -- which
+  # is how a renamed field, a moved frame flag or the wrong base64 alphabet could
+  # ship. Literal fixtures cover what we know to pin; this covers what we did not
+  # think of.
+  #
+  # It is a job of its own because it is the only thing in CI that needs the
+  # network at test time: uv fetches aiosendspin from PyPI. A PyPI outage then
+  # fails this job rather than the one that speaks for the tree, and the build
+  # job stays a statement about the tree alone.
+  interop:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+
+      # uv itself is pinned, and the test pins the aiosendspin version, because which
+      # version Music Assistant ships is the thing under test. What is NOT pinned is
+      # the rest of what uv resolves: no lockfile, no hashes, and it is executed. That
+      # is a weaker promise than the commit-pinned actions above, and it is the reason
+      # this is a separate job with nothing but `contents: read` and no secrets -- the
+      # blast radius is one runner.
+      - run: pipx install uv==0.11.2
+
+      # -count=1 because a cached pass would say nothing about the peer, and the
+      # test fails rather than skips if uv is missing: asked for and not run is
+      # the outcome worth avoiding.
+      - run: SENDSPIN_INTEROP=1 go test -count=1 -run TestInteropWithTheReferenceServer ./internal/sendspin/
+
+  # The four Python scripts in deploy/ promise stock macOS's /usr/bin/python3,
+  # which is 3.9. Nothing else here runs them, and a newer
+  # interpreter accepts syntax 3.9 rejects. --help also runs every top-level
+  # import and statement, and running the file itself checks its shebang and
+  # executable bit.
+  dot-scripts:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.9'
+      - run: python -X oldparser -m py_compile deploy/dot_firmware.py
+      # dot_firmware.py runs firebreak, which needs the network, so a uvx that
+      # echoes its arguments stands in. The target is translated, the flags
+      # pass through, and the exit status comes back.
+      - name: dot_firmware.py runs firebreak with the translated target
+        run: |
+          mkdir fake
+          printf '#!/bin/sh\necho "$*"\nexit 3\n' > fake/uvx
+          chmod +x fake/uvx
+          check() {
+            want=$1
+            shift
+            status=0
+            got=$(PATH="$PWD/fake:$PATH" ./deploy/dot_firmware.py "$@" 2>/dev/null) || status=$?
+            [ "$got" = "$want" ] && [ "$status" = 3 ] ||
+              { echo "dot_firmware.py $*: got '$got', status $status; want '$want'"; exit 1; }
+          }
+          check 'firebreak@latest'
+          check 'firebreak@latest --help' --help
+          check 'firebreak@latest amonet-biscuit-v1.1.0-bboe --verbose' v1-bboe --verbose
+          check 'firebreak@latest --short amonet-biscuit-v1.1.0' --short v1
+          check 'firebreak@latest amonet-biscuit-v2.0.0' v2
+          check 'firebreak@latest stock 8146' stock 8146
+      - run: python -X oldparser -m py_compile deploy/install.py
+      - run: ./deploy/install.py --help
+      - run: python -X oldparser -m py_compile deploy/uninstall.py
+      - run: ./deploy/uninstall.py --help
+
+  # The hooks a contributor may not have installed: CodeSorter's order and
+  # ruff's lint and format, against ruff.toml.
+  pre-commit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - run: pipx run pre-commit==4.6.0 run --all-files --show-diff-on-failure
+
+  # The release is a job here rather than a workflow of its own, so that it can
+  # say `needs:` and mean it. A tag pushed at a commit whose tests fail
+  # produces nothing: there is no second workflow to race, and no verdict to go
+  # and ask for. A fork's pull request cannot carry a refs/tags ref, so the
+  # condition is the whole guard on everything below it.
+  #
+  # The slash is excluded here as well as by the trigger's own `v*`, which does
+  # not match one either, so today this can never be false. It stays because it
+  # guards something the trigger does not: every path below is derived from the
+  # tag, and a slash in it publishes a tarball whose SHA256SUMS and attestation
+  # both name a file the release does not contain. A `startsWith` on its own is
+  # broader than the filter, so loosening the trigger would make this the only
+  # thing standing between a tag like v1.0/rc1 and a broken release.
+  release:
+    needs: [build, dot-scripts, pre-commit]
+    if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '/')
+    # The signing key is a secret of this environment, not of the repository:
+    # a branch pushed here runs CI with every repository secret, and the
+    # environment admits only v* tags.
+    environment: release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write      # create the release and upload its assets
+      id-token: write      # sign the provenance attestation
+      attestations: write  # record it
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6
+        with:
+          distribution: zulu
+          java-version: '17'
+      - uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4
+        with:
+          packages: 'platforms;android-22 build-tools;34.0.0'
+
+      # OVERDUB_VERSION is the only thing the release build does differently: it
+      # stamps the tag into the binary, so a downloaded one can say what it is.
+      # The runner's NDK is not the NDK anybody else has, so this binary is not
+      # expected to match a local build byte for byte.
+      - run: echo "ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+      - run: OVERDUB_VERSION="$GITHUB_REF_NAME" ./build.sh
+
+      - name: Build mapdump.jar
+        run: |
+          export ANDROID_JAR="$ANDROID_SDK_ROOT/platforms/android-22/android.jar"
+          export R8_JAR="$ANDROID_SDK_ROOT/build-tools/34.0.0/lib/d8.jar"
+          deploy/mapdump/build.sh
+
+      # The tarball is the whole install: the scripts, the binary, the jar, and
+      # the documentation that explains them. Somebody unpacking it needs adb,
+      # Python 3.9 or later and a rooted Dot, and no Go, NDK, JDK or Android
+      # SDK at all. Rooting a Dot is firebreak's, so no rooting script is in it.
+      #
+      # THIRD-PARTY.txt travels with it because clause 2 of the BSD licences
+      # compiled into the binary asks that it does.
+      - name: Assemble the tarball
+        run: |
+          # A run: step is bash -e without pipefail, so tar's failure in the
+          # pipeline below would be reported as gzip's success, and a truncated
+          # archive would be hashed, attested and published.
+          set -o pipefail
+          dir="overdub-$GITHUB_REF_NAME"
+          mkdir -p "$dir/build" "$dir/deploy/mapdump"
+          cp README.md LICENSE.txt THIRD-PARTY.txt "$dir/"
+          cp -r docs "$dir/docs"
+          cp deploy/install.py deploy/uninstall.py deploy/overdub.sh "$dir/deploy/"
+          cp build/overdub "$dir/build/overdub"
+          cp deploy/mapdump/mapdump.jar "$dir/deploy/mapdump/"
+          # Same inputs, same tarball: the mtimes, ordering and owner a tar
+          # otherwise picks up from the runner are pinned, and gzip -n keeps
+          # the name and timestamp out of the header.
+          tar --sort=name --owner=0 --group=0 --numeric-owner \
+              --mtime="@$(git log -1 --pretty=%ct)" -cf - "$dir" |
+            gzip -n > "$dir.tar.gz"
+          sha256sum "$dir.tar.gz" > SHA256SUMS
+          cat SHA256SUMS
+
+      # The daemon installs an update only when SHA256SUMS.sig checks against
+      # deploy/release-signing.pub, which the binary embeds. SHA256SUMS comes
+      # from the same release as the tarball, so on its own it proves only that
+      # a download is whole. Verifying here fails the release when the secret
+      # is missing or is not that key's pair, rather than publishing a release
+      # no Dot will install.
+      - name: Sign SHA256SUMS
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          key=$(mktemp)
+          trap 'rm -f "$key"' EXIT
+          printf '%s\n' "$RELEASE_SIGNING_KEY" > "$key"
+          openssl pkeyutl -sign -rawin -inkey "$key" -in SHA256SUMS -out SHA256SUMS.sig
+          openssl pkeyutl -verify -rawin -pubin -inkey deploy/release-signing.pub \
+            -in SHA256SUMS -sigfile SHA256SUMS.sig
+
+      # A missing notice is invisible to everything else here: the tarball
+      # unpacks, installs and runs without either file.
+      - name: The notices travel with the binary
+        run: |
+          tar tzf "overdub-$GITHUB_REF_NAME.tar.gz" |
+            grep -qFx "overdub-$GITHUB_REF_NAME/LICENSE.txt"
+          tar tzf "overdub-$GITHUB_REF_NAME.tar.gz" |
+            grep -qFx "overdub-$GITHUB_REF_NAME/THIRD-PARTY.txt"
+
+      # So is a missing or non-executable script: nothing above runs the
+      # tarball's copies.
+      - name: The scripts travel with the binary, executable
+        run: |
+          listing=$(tar tvzf "overdub-$GITHUB_REF_NAME.tar.gz")
+          for f in install.py uninstall.py overdub.sh; do
+            awk -v p="overdub-$GITHUB_REF_NAME/deploy/$f" \
+              '$1 == "-rwxr-xr-x" && $NF == p { ok = 1 } END { exit !ok }' <<<"$listing" ||
+              { echo "not in the tarball, or not executable: deploy/$f"; exit 1; }
+          done
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
+        with:
+          subject-path: overdub-${{ github.ref_name }}.tar.gz
+
+      # Drafted first and published second, because gh uploads the assets after
+      # creating the release: a failed upload would otherwise leave a release
+      # anybody can see and nobody can install from.
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # A hyphen is semver's own mark for a prerelease, and GitHub infers
+          # nothing from the tag: without this an rc becomes Latest release and
+          # the download link everybody follows points at a candidate.
+          case "$GITHUB_REF_NAME" in
+            *-*) prerelease=--prerelease ;;
+            *)   prerelease= ;;
+          esac
+          # shellcheck disable=SC2086  # deliberately unquoted: empty means absent
+          gh release create "$GITHUB_REF_NAME" --draft $prerelease --verify-tag \
+            --generate-notes "overdub-$GITHUB_REF_NAME.tar.gz" SHA256SUMS SHA256SUMS.sig
+          gh release edit "$GITHUB_REF_NAME" --draft=false

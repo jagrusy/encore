@@ -1,0 +1,44 @@
+# This workflow will install Python dependencies, run tests and lint
+# For more information see: https://help.github.com/actions/language-and-framework-guides/using-python-with-github-actions
+
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code from GitHub
+        uses: actions/checkout@v7.0.1
+      - name: Set up Python
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --dev --extra server
+      - name: Lint with pre-commit
+        run: SKIP=no-commit-to-branch uv run pre-commit run --all-files
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version:
+          - "3.12"
+    steps:
+      - name: Check out code from GitHub
+        uses: actions/checkout@v7.0.1
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+      - run: uv sync --dev --extra server
+      - name: Pytest
+        run: uv run pytest --durations 10 --cov-report term-missing --cov=aiosendspin --cov-report=xml tests/

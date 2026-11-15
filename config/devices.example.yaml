@@ -1,0 +1,124 @@
+# Project Encore — Mesh Device Inventory
+# Copy this file to config/devices.yaml and fill in your actual IPs, MACs, and RTSP URLs.
+
+project:
+  name: encore
+  domain: encore.local
+
+hub:
+  name: surface-pro-3
+  host: 192.168.1.50
+  arch: x86_64
+  ram_gb: 8
+  storage_gb: 256
+  vaapi_device: /dev/dri/renderD128
+  brain_port: 8765
+  ai_agent:
+    # Point this at your local LLM / AI agent daemon running on the Surface Pro 3
+    endpoint: http://127.0.0.1:8080/v1/chat/completions
+    model: local-assistant
+    tts_endpoint: http://127.0.0.1:5000/api/tts
+
+cast_devices:
+  # AirConnect (aircast) automatically discovers all Google Cast devices and speaker groups
+  # on your LAN and exposes them as AirPlay targets. Music Assistant casts to them natively.
+  - id: kitchen-nest-hub
+    name: "Kitchen Nest Hub"
+    room: kitchen
+    ip: 192.168.1.60
+    mac: "AA:BB:CC:DD:EE:10"
+    has_screen: true
+    protocol: google-cast
+
+  - id: living-room-tv
+    name: "Living Room TV"
+    room: living-room
+    ip: 192.168.1.61
+    has_screen: true
+    protocol: google-cast
+
+smart_nodes:
+  # USB-unlockable nodes running Encore/Overdub or LineageOS + Show Agent
+  - id: living-room-dot2
+    type: echo-dot-gen2
+    codename: biscuit
+    room: living-room
+    ip: 192.168.1.71
+    overdub_name: living-room-dot
+    esphome_port: 6053
+    sendspin: true
+    # Optional: MAC address of a 3rd-Gen Echo Dot in the next room paired to this Dot's Bluetooth
+    bluetooth_relay_mac: ""
+
+  - id: office-show5
+    type: echo-show5-gen1
+    codename: checkers
+    room: office
+    ip: 192.168.1.72
+    adb_port: 5555
+    kiosk_url: http://192.168.1.50:8765/ui/show5.html?node=office-show5
+    sendspin: true
+    airplay_name: "Office Echo Show"
+    bluetooth_relay_mac: ""
+
+  - id: bedroom-show5
+    type: echo-show5-gen1
+    codename: checkers
+    room: bedroom
+    ip: 192.168.1.73
+    adb_port: 5555
+    kiosk_url: http://192.168.1.50:8765/ui/show5.html?node=bedroom-show5
+    sendspin: true
+    airplay_name: "Bedroom Echo Show"
+    bluetooth_relay_mac: ""
+
+bluetooth_satellites:
+  # Locked 3rd-Gen Echo Dots ("donut") & 2nd-Gen Standard Echo ("radar")
+  # Pair each device to the closest host node, mute its mic, and block its MAC from WAN on your router.
+  - id: living-room-dot3
+    type: echo-dot-gen3
+    codename: donut
+    room: living-room
+    host_node: surface-pro-3
+    bt_mac: "AA:BB:CC:DD:EE:01"
+    airplay_name: "Living Room Echo Dot"
+    airplay_port: 5101
+
+  # Example additional satellites (uncomment and replace AA:BB:CC:DD:EE:xx with real MACs):
+  # - id: garage-dot3
+  #   type: echo-dot-gen3
+  #   codename: donut
+  #   room: garage
+  #   host_node: surface-pro-3
+  #   bt_mac: "AA:BB:CC:DD:EE:02"
+  #   airplay_name: "Garage Echo Dot"
+  #   airplay_port: 5102
+  # - id: hallway-dot3
+  #   type: echo-dot-gen3
+  #   codename: donut
+  #   room: hallway
+  #   host_node: living-room-dot2
+  #   bt_mac: "AA:BB:CC:DD:EE:03"
+  #   airplay_name: "Hallway Echo Dot"
+  # - id: bathroom-dot3
+  #   type: echo-dot-gen3
+  #   codename: donut
+  #   room: bathroom
+  #   host_node: bedroom-show5
+  #   bt_mac: "AA:BB:CC:DD:EE:04"
+  #   airplay_name: "Bathroom Echo Dot"
+
+cameras:
+  - id: front_door
+    name: "Front Door"
+    rtsp_url: "rtsp://user:pass@192.168.1.90:554/h264Preview_01_sub"
+    homekit_pin: "194-20-845"
+    pop_up_on_show5: true
+    alert_duration_sec: 30
+
+  - id: driveway
+    name: "Driveway"
+    rtsp_url: "rtsp://user:pass@192.168.1.91:554/h264Preview_01_sub"
+    homekit_pin: "194-20-846"
+    pop_up_on_show5: true
+    alert_duration_sec: 30

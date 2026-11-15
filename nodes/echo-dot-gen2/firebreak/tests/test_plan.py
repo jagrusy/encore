@@ -1,0 +1,604 @@
+from __future__ import annotations
+
+import dataclasses
+import struct
+import uuid
+from typing import TYPE_CHECKING
+
+import pytest
+
+from firebreak import plan
+from firebreak.android import gpt
+from firebreak.devices import LK_VALUES
+from firebreak.devices.biscuit import (
+    BISCUIT,
+    BOOT_MOVED_LAYOUT,
+    STOCK_LAYOUT,
+    UNLOCK_FROM_BOOTROM,
+    UNLOCK_TO_FIREOS5,
+    UNLOCK_TO_FIREOS6,
+    UNLOCK_V2_FROM_BOOTROM,
+)
+from firebreak.devices.crown import AMONET_V2_0_1
+from firebreak.devices.radar import AMONET_V1_0_1
+from firebreak.plugin import (
+    BOOT0,
+    Device,
+    FastbootFlash,
+    PayloadCommand,
+    ResetBcb,
+    Unlock,
+    Write,
+)
+
+if TYPE_CHECKING:
+    import pathlib
+
+BACKUP_ADDRESS = 7651327
+BISCUIT_SHUFFLED = (
+    ("kb", 2048, 4095),
+    ("dkb", 4096, 6143),
+    ("lk_a", 32768, 34815),
+    ("tee1", 49152, 59391),
+    ("lk_b", 65536, 67583),
+    ("tee2", 81920, 92159),
+    ("expdb", 98304, 118783),
+    ("misc", 118784, 119808),
+    ("persist", 131072, 163839),
+    ("boot_a_x", 163840, 196607),
+    ("boot_b_x", 196608, 229375),
+    ("recovery", 229376, 262143),
+    ("system_a", 294912, 1867775),
+    ("system_b", 1867776, 3440639),
+    ("cache", 3440640, 5046271),
+    ("userdata", 5046272, 7199743),
+    ("boot_a", 7199744, 7425023),
+    ("boot_b", 7425024, 7650303),
+)
+BISCUIT_STOCK = (
+    ("kb", 2048, 4095),
+    ("dkb", 4096, 6143),
+    ("lk_a", 32768, 34815),
+    ("tee1", 49152, 59391),
+    ("lk_b", 65536, 67583),
+    ("tee2", 81920, 92159),
+    ("expdb", 98304, 118783),
+    ("misc", 118784, 119808),
+    ("persist", 131072, 163839),
+    ("boot_a", 163840, 196607),
+    ("boot_b", 196608, 229375),
+    ("recovery", 229376, 262143),
+    ("system_a", 294912, 1867775),
+    ("system_b", 1867776, 3440639),
+    ("cache", 3440640, 5046271),
+    ("userdata", 5046272, 7651294),
+)
+CROWN_MADE_UP = (
+    ("lk", 2048, 4095),
+    ("tee1", 8192, 18431),
+    ("tee2", 18432, 28671),
+    ("expdb", 32768, 53247),
+    ("MISC", 53248, 54271),
+    ("boot", 65536, 98303),
+    ("recovery", 98304, 131071),
+    ("swdl", 131072, 163839),
+    ("userdata", 163840, 7651294),
+)
+IMAGES = {
+    "biscuit-kaeru.bin": 266640,
+    "boot.hdr": 96,
+    "boot.payload": 13888,
+    "crown-kaeru.bin": 266640,
+    "lk.bin": 372736,
+    "preloader.img": 1048576,
+    "radar-kaeru.bin": 266640,
+    "tee-payload.bin": 1107464,
+    "twrp.img": 9000000,
+    "tz.img": 2641920,
+}
+RADAR_BACKUP_ADDRESS = 7634943
+RADAR_STOCK = (*BISCUIT_STOCK[:-1], ("userdata", 5046272, 7634910))
+SECTOR = 512
+TWRP_SIZE = 13953024
+
+
+@pytest.fixture
+def source(*, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> pathlib.Path:
+    root = tmp_path / "amonet"
+    (root / "bin").mkdir(parents=True)
+    for name, size in IMAGES.items():
+        (root / "bin" / name).write_bytes(name.encode().ljust(size, b"\0"))
+    twrp = tmp_path / "twrp.img"
+    twrp.write_bytes(b"T" * TWRP_SIZE)
+    monkeypatch.setattr(name="fetch", target=plan, value=lambda **_: twrp)
+    return root
+
+
+def amonet_v2_writes(
+    *, backup: int = BACKUP_ADDRESS
+) -> list[tuple[str, str | None, int, int]]:
+    return [
+        ("Repartition", "disk", 0, 17408),
+        ("Repartition", "disk", (backup - 32) * SECTOR, 16896),
+        ("ZeroRpmb", None, -1, -1),
+        ("Write", "tee2", 81920 * SECTOR, 2641920),
+        ("Write", "lk_a", 32768 * SECTOR, 372736),
+        ("Write", "lk_b", 65536 * SECTOR, 372736),
+        ("Write", "expdb", 98304 * SECTOR, 266752),
+        ("Write", "tee1", 49152 * SECTOR, 1107968),
+        ("Write", BOOT0, 0, 1048576),
+        ("ForceFastboot", "misc", 118784 * SECTOR, 16),
+        ("Reboot", None, -1, -1),
+        ("FastbootFlash", "recovery", 229376 * SECTOR, 9000448),
+        ("Reboot", "recovery", -1, -1),
+    ]
+
+
+def amonet_writes(*, recovery: int) -> list[tuple[str, str | None, int, int]]:
+    boot_a, boot_b, payload = 7199744, 7425024, 223207
+    return [
+        ("ClearBoot0Header", BOOT0, 0, 4096),
+        ("Repartition", "disk", 0, 17408),
+        ("Repartition", "disk", (BACKUP_ADDRESS - 32) * SECTOR, 16896),
+        ("Repartition", "userdata", 5046272 * SECTOR, 10 * SECTOR),
+        ("ZeroRpmb", None, -1, -1),
+        ("Write", "boot_a", boot_a * SECTOR, 512),
+        ("Write", "boot_a", (boot_a + payload) * SECTOR, 14336),
+        ("Write", "boot_b", boot_b * SECTOR, 512),
+        ("Write", "boot_b", (boot_b + payload) * SECTOR, 14336),
+        ("Write", "tee1", 49152 * SECTOR, 2641920),
+        ("Write", "lk_a", 32768 * SECTOR, 372736),
+        ("Write", "lk_b", 65536 * SECTOR, 372736),
+        ("ForceFastboot", "expdb", 98304 * SECTOR, 16),
+        ("ResetBcb", "misc", 118785 * SECTOR + 0x160, 7),
+        ("Write", BOOT0, 0, 1048576),
+        ("Reboot", None, -1, -1),
+        ("FastbootFlash", "tee2", 81920 * SECTOR, 2641920),
+        ("FastbootFlash", "recovery", 229376 * SECTOR, recovery),
+        ("Reboot", "recovery", -1, -1),
+    ]
+
+
+def biscuit_table(
+    *, backup: int = BACKUP_ADDRESS, layout: tuple[tuple[str, int, int], ...]
+) -> bytes:
+    entries = b"".join(
+        b"T" * 16
+        + uuid.uuid5(uuid.NAMESPACE_OID, name).bytes_le
+        + struct.pack("<QQ", first, last)
+        + bytes(8)
+        + name.encode(encoding="utf-16le").ljust(72, b"\0")
+        for name, first, last in layout
+    ).ljust(gpt.ENTRIES_SIZE, b"\0")
+    template = bytearray(92)
+    template[:16] = b"EFI PART" + b"\0\0\1\0" + struct.pack("<I", 92)
+    template[24:56] = struct.pack("<QQQQ", 1, backup, 34, backup - 33)
+    template[56:72] = b"D" * 16
+    template[80:88] = struct.pack("<II", 128, 128)
+    return gpt.rebuilt_gpt(entries=entries, raw=b"M" * SECTOR + bytes(template)).primary
+
+
+def described(*, actions: tuple[plan.Action, ...]) -> list[tuple]:
+    return [
+        (
+            action.kind,
+            action.target,
+            -1 if action.offset is None else action.offset,
+            -1 if action.length is None else action.length,
+        )
+        for action in actions
+    ]
+
+
+def reordered_overlaps(*, actions: tuple[plan.Action, ...]) -> list[tuple[str, str]]:
+    def span(action: plan.Action) -> tuple[str, int, int]:
+        first = action.offset // SECTOR
+        end = -(-(action.offset + action.length) // SECTOR)
+        return ("boot0" if action.target == BOOT0 else "disk", first, end)
+
+    found = []
+    writes = [action for action in actions if action.length]
+    for index, unrecoverable in enumerate(writes):
+        if not unrecoverable.unrecoverable:
+            continue
+        place, first, end = span(unrecoverable)
+        for later in writes[index + 1 :]:
+            other, later_first, later_end = span(later)
+            if (
+                not later.unrecoverable
+                and other == place
+                and later_first < end
+                and first < later_end
+            ):
+                found.append((unrecoverable.label, later.label))
+    return found
+
+
+def test_a_device_without_a_needed_feature_is_refused(*, source: pathlib.Path) -> None:
+    unlock = Unlock(
+        device=Device(features=frozenset(), name="bare", product="BARE", title="Bare"),
+        family="amonet",
+        layout=STOCK_LAYOUT,
+        plan=(),
+        requires=UNLOCK_TO_FIREOS5.requires,
+        source=UNLOCK_TO_FIREOS5.source,
+        version="1",
+    )
+    with pytest.raises(ValueError, match=r"amonet-bare-v1 needs \['ab-slots'"):
+        plan.resolve(raw=b"", source=source, unlock=unlock)
+
+
+def test_a_fastboot_flash_resolves_without_the_partition_being_in_the_table(
+    *, source: pathlib.Path
+) -> None:
+    held = plan.action(
+        partitions={},
+        source=source,
+        step=FastbootFlash(image="bin/lk.bin", target="recovery"),
+        unlock=AMONET_V2_0_1,
+    )
+    assert held.kind == "FastbootFlash"
+    assert held.image is not None
+    assert held.image.is_file()
+    assert held.offset is None
+    assert held.partition is None
+    assert held.target == "recovery"
+
+
+def test_a_half_shuffled_table_is_refused(*, source: pathlib.Path) -> None:
+    layout = tuple(
+        ("boot_b", first, last) if name == "boot_b_x" else (name, first, last)
+        for name, first, last in BISCUIT_SHUFFLED
+        if name != "boot_b"
+    )
+    with pytest.raises(ValueError, match="has boot_a_x but not boot_b_x"):
+        plan.resolve(
+            raw=biscuit_table(layout=layout),
+            source=source,
+            unlock=UNLOCK_TO_FIREOS5,
+        )
+
+
+def test_a_payload_command_carries_its_command_and_its_settle(
+    *, source: pathlib.Path
+) -> None:
+    held = plan.action(
+        partitions={},
+        source=source,
+        step=PayloadCommand(command=0x6000, label="set the fastboot flag", settle=5.0),
+        unlock=AMONET_V2_0_1,
+    )
+    assert held.kind == "PayloadCommand"
+    assert held.command == 0x6000
+    assert held.settle == pytest.approx(5.0)
+    assert held.target is None
+
+
+def test_a_repartition_without_a_layout_is_refused(*, source: pathlib.Path) -> None:
+    unlock = dataclasses.replace(UNLOCK_TO_FIREOS6, layout=None)
+    with pytest.raises(ValueError, match="repartitions but names no layout"):
+        plan.resolve(
+            raw=biscuit_table(layout=BISCUIT_STOCK), source=source, unlock=unlock
+        )
+
+
+@pytest.mark.parametrize(
+    argnames=("step", "error", "match"),
+    argvalues=[
+        (Write(image="bin/lk.bin", target="lk_c"), KeyError, "biscuit has no lk_c"),
+        (ResetBcb(target="para"), KeyError, "biscuit has no para"),
+        (Write(image="bin/none.img", target="lk_a"), FileNotFoundError, "none.img"),
+        (Write(image="bin/tz.img", target="lk_a"), ValueError, "lk_a leaves 1048576"),
+        (
+            Write(image="bin/boot.payload", sector_offset=2048, target="lk_a"),
+            ValueError,
+            "after 2048 sectors",
+        ),
+    ],
+)
+def test_a_step_that_cannot_resolve(
+    *, error: type[Exception], match: str, source: pathlib.Path, step: object
+) -> None:
+    unlock = Unlock(
+        device=BISCUIT,
+        family="amonet",
+        layout=STOCK_LAYOUT,
+        plan=(step,),
+        requires=frozenset(),
+        source=UNLOCK_TO_FIREOS5.source,
+        version="1",
+    )
+    with pytest.raises(error, match=match):
+        plan.resolve(
+            raw=biscuit_table(layout=BISCUIT_STOCK), source=source, unlock=unlock
+        )
+
+
+def test_a_stock_sized_table_with_a_moved_partition_is_refused() -> None:
+    layout = tuple(
+        ("boot_a_x", first, last) if name == "boot_a" else (name, first, last)
+        for name, first, last in BISCUIT_STOCK
+    )
+    with pytest.raises(ValueError, match="has boot_a_x but not boot_b_x"):
+        plan.repartitioned(
+            layouts=BISCUIT.layouts,
+            raw=biscuit_table(layout=layout),
+            want=STOCK_LAYOUT,
+        )
+
+
+def test_a_table_in_no_layout_the_device_carries_is_refused(
+    *, source: pathlib.Path
+) -> None:
+    with pytest.raises(ValueError, match="with 15 partitions, is in no layout"):
+        plan.resolve(
+            raw=biscuit_table(layout=BISCUIT_STOCK[:-1]),
+            source=source,
+            unlock=UNLOCK_TO_FIREOS5,
+        )
+
+
+def test_a_table_that_is_not_intact_is_refused(*, source: pathlib.Path) -> None:
+    raw = bytearray(biscuit_table(layout=BISCUIT_SHUFFLED))
+    raw[2 * SECTOR + 40] ^= 1
+    with pytest.raises(ValueError, match=r"^the partition table is not intact$"):
+        plan.resolve(raw=bytes(raw), source=source, unlock=UNLOCK_TO_FIREOS5)
+
+
+@pytest.mark.parametrize(
+    argnames="unlock",
+    argvalues=[
+        AMONET_V1_0_1,
+        AMONET_V2_0_1,
+        UNLOCK_FROM_BOOTROM,
+        UNLOCK_TO_FIREOS5,
+        UNLOCK_TO_FIREOS6,
+        UNLOCK_V2_FROM_BOOTROM,
+    ],
+    ids=lambda unlock: unlock.name,
+)
+def test_an_unlock_declares_only_a_bootloader_its_own_device_has(
+    *, unlock: Unlock
+) -> None:
+    assert not unlock.little_kernel or unlock.little_kernel in LK_VALUES[unlock.device]
+
+
+def test_crown_v2_0_1_matches_amonet(*, source: pathlib.Path) -> None:
+    actions = plan.resolve(
+        raw=biscuit_table(layout=CROWN_MADE_UP),
+        source=source,
+        unlock=AMONET_V2_0_1,
+    )
+    assert described(actions=actions) == [
+        ("ClearBoot0Header", BOOT0, 0, 4096),
+        ("ZeroRpmb", None, -1, -1),
+        ("Write", "tee2", 18432 * SECTOR, 2641920),
+        ("Write", "lk", 2048 * SECTOR, 372736),
+        ("Write", "expdb", 32768 * SECTOR, 266752),
+        ("Write", "tee1", 8192 * SECTOR, 1107968),
+        ("Write", BOOT0, 0, 1048576),
+        ("ForceFastboot", "MISC", 53248 * SECTOR, 16),
+        ("Reboot", None, -1, -1),
+        ("FastbootFlash", "recovery", 98304 * SECTOR, 9000448),
+        ("FastbootFlash", "swdl", 131072 * SECTOR, 9000448),
+        ("Reboot", "recovery", -1, -1),
+    ]
+    assert [action.unrecoverable for action in actions].count(True) == 1
+    assert actions[6].unrecoverable
+    assert reordered_overlaps(actions=actions) == []
+    assert actions[1].expect == b"AMZN"
+    assert actions[4].image == source / "bin" / "crown-kaeru.bin"
+
+
+@pytest.mark.parametrize(
+    argnames="unlock",
+    argvalues=[
+        UNLOCK_FROM_BOOTROM,
+        UNLOCK_TO_FIREOS5,
+        UNLOCK_TO_FIREOS6,
+        UNLOCK_V2_FROM_BOOTROM,
+        AMONET_V1_0_1,
+    ],
+    ids=lambda unlock: unlock.name,
+)
+@pytest.mark.parametrize(
+    argnames="layout",
+    argvalues=[BISCUIT_STOCK, BISCUIT_SHUFFLED],
+    ids=["stock", "shuffled"],
+)
+def test_no_plan_yet_has_a_recoverable_write_over_an_earlier_unrecoverable_one(
+    *,
+    layout: tuple[tuple[str, int, int], ...],
+    source: pathlib.Path,
+    unlock: Unlock,
+) -> None:
+    actions = plan.resolve(
+        raw=biscuit_table(layout=layout), source=source, unlock=unlock
+    )
+    assert reordered_overlaps(actions=actions) == []
+    assert reordered_overlaps(
+        actions=(
+            plan.Action(
+                kind="Write",
+                label="preloader",
+                length=1024,
+                offset=0,
+                target=BOOT0,
+                unrecoverable=True,
+            ),
+            plan.Action(kind="Write", label="lk", length=512, offset=0, target="lk_a"),
+            plan.Action(
+                kind="Write", label="patch", length=7, offset=1000, target=BOOT0
+            ),
+        )
+    ) == [("preloader", "patch")]
+
+
+def test_radar_v1_0_1_from_a_moved_table_matches_amonet(
+    *, source: pathlib.Path
+) -> None:
+    stock = biscuit_table(backup=RADAR_BACKUP_ADDRESS, layout=RADAR_STOCK)
+    moved, _ = BOOT_MOVED_LAYOUT.apply(raw=stock)
+    actions = plan.resolve(raw=moved, source=source, unlock=AMONET_V1_0_1)
+    assert described(actions=actions) == amonet_v2_writes(backup=RADAR_BACKUP_ADDRESS)
+    assert actions[0].data == stock
+    assert [action.unrecoverable for action in actions].count(True) == 1
+    assert actions[8].unrecoverable
+    assert actions[2].expect == b"AMZN"
+    assert actions[6].image == source / "bin" / "radar-kaeru.bin"
+    assert actions[11].image == source / "bin" / "twrp.img"
+
+
+def test_radar_v1_0_1_from_stock_leaves_the_table(*, source: pathlib.Path) -> None:
+    actions = plan.resolve(
+        raw=biscuit_table(backup=RADAR_BACKUP_ADDRESS, layout=RADAR_STOCK),
+        source=source,
+        unlock=AMONET_V1_0_1,
+    )
+    assert (
+        described(actions=actions) == amonet_v2_writes(backup=RADAR_BACKUP_ADDRESS)[2:]
+    )
+    assert actions[4].image == source / "bin" / "radar-kaeru.bin"
+
+
+def test_resolving_a_prefix_of_a_plan_gives_a_prefix_of_its_actions(
+    *, source: pathlib.Path
+) -> None:
+    stock = biscuit_table(layout=BISCUIT_STOCK)
+    whole = plan.resolve(raw=stock, source=source, unlock=UNLOCK_TO_FIREOS5)
+    steps = UNLOCK_TO_FIREOS5.plan
+    for count in range(1, len(steps) + 1):
+        prefix = dataclasses.replace(UNLOCK_TO_FIREOS5, plan=steps[:count])
+        actions = plan.resolve(raw=stock, source=source, unlock=prefix)
+        assert actions == whole[: len(actions)]
+    assert len(plan.resolve(raw=stock, source=source, unlock=UNLOCK_TO_FIREOS5)) == len(
+        whole
+    )
+
+
+def test_reverting_the_boot_moved_layout_gives_back_the_stock_table(
+    *, source: pathlib.Path
+) -> None:
+    stock = biscuit_table(layout=BISCUIT_STOCK)
+    shuffle = plan.resolve(raw=stock, source=source, unlock=UNLOCK_TO_FIREOS5)
+    raw, actions = plan.repartitioned(
+        layouts=BISCUIT.layouts, raw=shuffle[1].data, want=STOCK_LAYOUT
+    )
+    assert raw == stock
+    assert actions[1].data == gpt.rebuilt_gpt(entries=stock[1024:], raw=stock).backup
+    assert [(action.target, action.offset) for action in actions] == [
+        ("disk", 0),
+        ("disk", (BACKUP_ADDRESS - 32) * SECTOR),
+    ]
+
+
+def test_the_held_layout_is_reverted_before_the_wanted_one_is_applied() -> None:
+    seen: list[bytes] = []
+
+    @dataclasses.dataclass(frozen=True)
+    class Recorded:
+        name: str
+
+        def apply(self, *, raw: bytes) -> tuple[bytes, tuple[plan.Action, ...]]:
+            seen.append(raw)
+            return raw + b"+in", (plan.Action(kind="Repartition", label=self.name),)
+
+        def describes(self, *, raw: bytes) -> bool:
+            return raw == b"table" and self.name == "held"
+
+        def revert(self, *, raw: bytes) -> tuple[bytes, tuple[plan.Action, ...]]:
+            return raw + b"+out", (plan.Action(kind="Repartition", label=self.name),)
+
+    raw, actions = plan.repartitioned(
+        layouts=(Recorded(name="held"),), raw=b"table", want=Recorded(name="wanted")
+    )
+    assert [action.label for action in actions] == ["held", "wanted"]
+    assert seen == [b"table+out"]
+    assert raw == b"table+out+in"
+
+
+def test_v1_1_0_from_a_shuffled_table_skips_the_shuffle(
+    *, source: pathlib.Path
+) -> None:
+    stock = biscuit_table(layout=BISCUIT_STOCK)
+    shuffled = plan.resolve(raw=stock, source=source, unlock=UNLOCK_TO_FIREOS5)[1]
+    actions = plan.resolve(raw=shuffled.data, source=source, unlock=UNLOCK_TO_FIREOS5)
+    want = amonet_writes(recovery=TWRP_SIZE)
+    assert described(actions=actions) == [*want[:1], *want[4:]]
+    assert actions[-2].image.name == "twrp.img"
+
+
+def test_v1_1_0_from_stock_matches_amonet(*, source: pathlib.Path) -> None:
+    actions = plan.resolve(
+        raw=biscuit_table(layout=BISCUIT_STOCK),
+        source=source,
+        unlock=UNLOCK_TO_FIREOS5,
+    )
+    assert described(actions=actions) == amonet_writes(recovery=TWRP_SIZE)
+    assert [action.unrecoverable for action in actions].count(True) == 1
+    assert actions[14].unrecoverable
+    shuffled = gpt.partition_map(entries=actions[1].data[2 * SECTOR :])
+    assert (shuffled["boot_a"].first, shuffled["boot_b"].first) == (7199744, 7425024)
+    assert shuffled["userdata"].sectors == 7199743 - 5046272 + 1
+    assert actions[2].data[16384:].startswith(b"EFI PART")
+    assert actions[3].data == bytes(10 * SECTOR)
+    assert actions[0].data == b"EMMC_BOOT".ljust(4096, b"\0")
+    assert actions[12].data == b"FASTBOOT_PLEASE\0"
+    assert actions[13].data == b"\0ABB\x01\x8f\0"
+    assert actions[17].image == source.parent / "twrp.img"
+    assert actions[5].image == source / "bin" / "boot.hdr"
+    assert [action.partition.number for action in actions[5:9]] == [17, 17, 18, 18]
+    assert actions[3].partition == gpt.Partition(
+        first=5046272, number=16, sectors=7199743 - 5046272 + 1
+    )
+    assert actions[13].partition.number == 8
+    assert actions[0].partition is actions[1].partition is actions[14].partition is None
+
+
+def test_v1_1_0_from_the_bootrom_matches_amonet(*, source: pathlib.Path) -> None:
+    actions = plan.resolve(
+        raw=biscuit_table(layout=BISCUIT_STOCK),
+        source=source,
+        unlock=UNLOCK_FROM_BOOTROM,
+    )
+    assert described(actions=actions) == amonet_writes(recovery=9000448)
+    assert actions[17].image == source / "bin" / "twrp.img"
+
+
+def test_v2_0_0_from_a_shuffled_table_matches_amonet(*, source: pathlib.Path) -> None:
+    actions = plan.resolve(
+        raw=biscuit_table(layout=BISCUIT_SHUFFLED),
+        source=source,
+        unlock=UNLOCK_TO_FIREOS6,
+    )
+    assert described(actions=actions) == amonet_v2_writes()
+    restored = gpt.partition_map(entries=actions[0].data[2 * SECTOR :])
+    assert [
+        (name, part.first, part.first + part.sectors - 1)
+        for name, part in restored.items()
+    ] == list(BISCUIT_STOCK)
+    assert actions[1].data[16384:].startswith(b"EFI PART")
+    assert [action.unrecoverable for action in actions].count(True) == 1
+    assert actions[8].unrecoverable
+    assert actions[2].expect == b"AMZN"
+    assert actions[9].data == b"FASTBOOT_PLEASE\0"
+    assert actions[6].image == source / "bin" / "biscuit-kaeru.bin"
+    assert actions[7].image == source / "bin" / "tee-payload.bin"
+    assert actions[11].image == source / "bin" / "twrp.img"
+
+
+def test_v2_0_0_from_stock_leaves_the_table(*, source: pathlib.Path) -> None:
+    actions = plan.resolve(
+        raw=biscuit_table(layout=BISCUIT_STOCK),
+        source=source,
+        unlock=UNLOCK_TO_FIREOS6,
+    )
+    assert described(actions=actions) == amonet_v2_writes()[2:]
+
+
+def test_v2_0_0_undoes_v1_1_0s_shuffle_byte_for_byte(*, source: pathlib.Path) -> None:
+    stock = biscuit_table(layout=BISCUIT_STOCK)
+    shuffle = plan.resolve(raw=stock, source=source, unlock=UNLOCK_TO_FIREOS5)
+    actions = plan.resolve(raw=shuffle[1].data, source=source, unlock=UNLOCK_TO_FIREOS6)
+    assert actions[0].data == stock
+    assert actions[1].data == gpt.rebuilt_gpt(entries=stock[1024:], raw=stock).backup

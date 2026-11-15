@@ -1,0 +1,34 @@
+{
+  "upstreams": {
+    "firebreak": {
+      "path": "nodes/echo-dot-gen2/firebreak",
+      "url": "https://github.com/bboe/firebreak.git",
+      "branch": "main",
+      "commit": "307905d0e9543f544f9e95a043523d3bc147102f"
+    },
+    "overdub": {
+      "path": "nodes/echo-dot-gen2/overdub",
+      "url": "https://github.com/bboe/overdub.git",
+      "branch": "main",
+      "commit": "7dfeb1aba95014cdae0eae5b7567fc2040d7ee08"
+    },
+    "amonet-checkers": {
+      "path": "nodes/echo-show5-gen1/amonet-checkers",
+      "url": "https://github.com/R0rt1z2/amonet.git",
+      "branch": "mt8163-echo-show",
+      "commit": "d6179b8a2ba45fb641acc38b1cf3e848e8ff235d"
+    },
+    "aiosendspin": {
+      "path": "shared/aiosendspin",
+      "url": "https://github.com/Sendspin/aiosendspin.git",
+      "branch": "main",
+      "commit": "2174cdc4dd42145aa3b544d516a40a471f5b9781"
+    },
+    "airconnect": {
+      "path": "hub/airconnect/upstream",
+      "url": "https://github.com/philippe44/AirConnect.git",
+      "branch": "master",
+      "commit": "e2758fde86b3db627d1fa528604db565211fa1a1"
+    }
+  }
+}

@@ -1,0 +1,107 @@
+#!/usr/bin/python3
+import pathlib
+import subprocess
+import sys
+import tempfile
+import zipfile
+
+BY_NAME = pathlib.Path("/dev/block/platform/mtk-msdc.0/by-name")
+RECOVERY_LOG = pathlib.Path("/tmp/recovery.log")  # ruff: ignore[hardcoded-temp-file]
+RUN = pathlib.Path("/sim/run")
+WITH_TARGET = 3
+
+
+def install(*, path: str) -> int:
+    print(f"Installing zip file '{path}'")
+    logged(line=f"Installing zip file '{path}'")
+    try:
+        archive = zipfile.ZipFile(path)
+    except (OSError, zipfile.BadZipFile):
+        print("Invalid zip file format!")
+        logged(line="I:Updater process ended with RC=1")
+        return 1
+    names = set(archive.namelist())
+    active = (RUN / "active").read_text(encoding="utf-8").strip()
+    if "META-INF/com/android/metadata" in names:
+        metadata = dict(
+            line.partition("=")[::2]
+            for line in archive
+            .read("META-INF/com/android/metadata")
+            .decode()
+            .splitlines()
+        )
+        build = metadata.get("post-build", "unknown")
+        slot = "b" if active == "a" else "a"
+        with tempfile.TemporaryDirectory() as folder:
+            prop = pathlib.Path(folder) / "system" / "build.prop"
+            prop.parent.mkdir()
+            prop.write_text(
+                f"ro.build.version.name=Fire OS 6 (NS6574/{build})\n"
+                f"ro.build.fingerprint={build}\n",
+                encoding="utf-8",
+            )
+            (prop.parent / "etc").mkdir()
+            (prop.parent / "etc" / "hosts").write_text(
+                "127.0.0.1 localhost\n", encoding="utf-8"
+            )
+            (pathlib.Path(folder) / "default.prop").write_text(
+                "ro.adb.secure=1\n", encoding="utf-8"
+            )
+            (pathlib.Path(folder) / "init.sim.rc").write_text(
+                "service otad /system/bin/otad\n    class main\n"
+                "service update_engine /system/bin/update_engine\n"
+                "    class late_start\n",
+                encoding="utf-8",
+            )
+            subprocess.run(
+                [
+                    "mke2fs",
+                    "-q",
+                    "-F",
+                    "-t",
+                    "ext4",
+                    "-d",
+                    folder,
+                    str(BY_NAME / f"system_{slot}"),
+                ],
+                capture_output=True,
+                check=True,
+            )
+        (RUN / f"root-adb-{slot}").unlink(missing_ok=True)
+        (RUN / "active").write_text(slot + "\n", encoding="utf-8")
+        print("Installing update...")
+    else:
+        (RUN / f"root-adb-{active}").touch()
+        print("Installing boot-root...")
+        logged(line=f"slot _{active}: neutering ota updates")
+    print("Done processing script file")
+    logged(line="I:Updater process ended with RC=0")
+    return 0
+
+
+def logged(*, line: str) -> None:
+    with RECOVERY_LOG.open("a", encoding="utf-8") as log:
+        log.write(line + "\n")
+
+
+def main() -> int:
+    if len(sys.argv) == WITH_TARGET and sys.argv[1] == "install":
+        return install(path=sys.argv[2])
+    if len(sys.argv) == WITH_TARGET and sys.argv[1] == "wipe":
+        return wipe(part=sys.argv[2])
+    print("usage: twrp install <zip> | wipe <partition>", file=sys.stderr)
+    return 1
+
+
+def wipe(*, part: str) -> int:
+    name = {"data": "userdata"}.get(part, part)
+    subprocess.run(
+        ["mke2fs", "-q", "-F", "-t", "ext4", str(BY_NAME / name)],
+        capture_output=True,
+        check=True,
+    )
+    print(f"Wiping {part}... Done.")
+    return 0
+
+
+sys.exit(main())

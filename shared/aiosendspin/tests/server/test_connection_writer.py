@@ -1,0 +1,1817 @@
+"""Tests for SendspinConnection writer task behavior."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any, Never
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+from aiohttp import WSMessage, WSMsgType
+
+from aiosendspin.models import pack_binary_header_raw
+from aiosendspin.models.artwork import pack_artwork_cancel, pack_artwork_parts
+from aiosendspin.models.color import SessionUpdateColor
+from aiosendspin.models.core import (
+    ClientTimeMessage,
+    ClientTimePayload,
+    GroupUpdateServerMessage,
+    GroupUpdateServerPayload,
+    ServerCommandMessage,
+    ServerCommandPayload,
+    ServerStateMessage,
+    ServerStatePayload,
+    ServerTimeMessage,
+    ServerTimePayload,
+    StreamClearMessage,
+    StreamClearPayload,
+    StreamEndMessage,
+    StreamEndPayload,
+    StreamStartMessage,
+    StreamStartPayload,
+)
+from aiosendspin.models.metadata import SessionUpdateMetadata
+from aiosendspin.models.player import (
+    PLAYER_AUDIO_HEADER_SIZE,
+    SEND_AHEAD_MAX,
+    PlayerCommandPayload,
+    StreamStartPlayer,
+    pack_player_audio_frame,
+    unpack_player_audio_header,
+)
+from aiosendspin.models.types import AudioCodec, BinaryMessageType, PlayerCommand
+from aiosendspin.noise.constants import (
+    FRAGMENT_FLAG_LAST,
+    MAX_TRANSPORT_PLAINTEXT,
+    MSG_TYPE_FRAGMENT,
+)
+from aiosendspin.noise.wire import EncryptedWebSocket
+from aiosendspin.server import connection as connection_module
+from aiosendspin.server.audio import BufferTracker
+from aiosendspin.server.clock import LoopClock, ManualClock
+from aiosendspin.server.connection import (
+    MAX_PENDING_MSG,
+    SendspinConnection,
+    _BinaryData,
+    _RoleQueueEntry,
+)
+from aiosendspin.server.roles.base import AudioChunk, BinaryHandling
+from aiosendspin.server.roles.player.v1 import PlayerV1Role
+from tests.noise.conftest import FakeWebSocket, make_paired_sessions
+
+
+@dataclass(slots=True)
+class _DummyServer:
+    loop: asyncio.AbstractEventLoop
+    clock: Any
+    id: str = "srv"
+    name: str = "server"
+
+    def get_or_create_client(self, client_id: str) -> Never:
+        raise AssertionError(f"unexpected get_or_create_client({client_id}) in this test")
+
+    def is_external_player(self, client_id: str) -> bool:  # noqa: ARG002
+        return False
+
+
+def _make_player_client_stub() -> MagicMock:
+    client = MagicMock()
+    state_store: dict[str, object] = {}
+
+    def get_or_create_role_state(family: str, cls: type[object]) -> object:
+        state_store.setdefault(family, cls())
+        return state_store[family]
+
+    client.get_or_create_role_state.side_effect = get_or_create_role_state
+    client.info = MagicMock()
+    client.info.player_support = None
+    client.group = MagicMock()
+    client._server = MagicMock()  # noqa: SLF001
+    client._logger = MagicMock()  # noqa: SLF001
+    client.client_id = "test-player"
+    client.connection = None
+    client.send_role_message = MagicMock()
+    return client
+
+
+def test_binary_data_supports_buffer_registration_metadata() -> None:
+    """_BinaryData should optionally carry buffer registration info."""
+    simple = _BinaryData(data=b"test", message_type=4)
+    assert simple.buffer_end_time_us is None
+    assert simple.buffer_byte_count is None
+
+    with_meta = _BinaryData(
+        data=b"test",
+        message_type=4,
+        buffer_end_time_us=1_000_000,
+        buffer_byte_count=1234,
+    )
+    assert with_meta.buffer_end_time_us == 1_000_000
+    assert with_meta.buffer_byte_count == 1234
+
+    entry = _RoleQueueEntry(epoch=1, timestamp_us=0, binary=with_meta)
+    assert entry.binary is not None
+    assert entry.binary.buffer_end_time_us == 1_000_000
+
+
+@pytest.mark.asyncio
+async def test_send_binary_accepts_buffer_metadata() -> None:
+    """send_binary should accept optional buffer registration parameters."""
+    loop = asyncio.get_running_loop()
+    server = _DummyServer(loop=loop, clock=LoopClock(loop))
+
+    wsock = MagicMock()
+    wsock.closed = False
+
+    conn = SendspinConnection(server, wsock_client=wsock)
+    conn._transport = wsock  # noqa: SLF001
+
+    conn.send_binary(
+        b"audio_data",
+        role="player",
+        timestamp_us=0,
+        message_type=BinaryMessageType.AUDIO_CHUNK.value,
+        buffer_end_time_us=1_000_000,
+        buffer_byte_count=100,
+    )
+
+    # Access the per-role queue
+    role_queue = conn._role_queues.get("player")  # noqa: SLF001
+    assert role_queue is not None
+    assert len(role_queue) == 1
+    _, _, entry = role_queue[0]
+    assert entry.binary is not None
+    assert entry.binary.buffer_end_time_us == 1_000_000
+    assert entry.binary.buffer_byte_count == 100
+
+
+@pytest.mark.asyncio
+async def test_writer_counts_buffer_while_transmitting() -> None:
+    """Writer registers the chunk before send_bytes and finishes it once the send returns."""
+    loop = asyncio.get_running_loop()
+    server = _DummyServer(loop=loop, clock=LoopClock(loop))
+
+    wsock = MagicMock()
+    wsock.closed = False
+    wsock.send_str = AsyncMock()
+    calls: list[str] = []
+
+    async def send_bytes(_data: bytes) -> None:
+        calls.append("send_bytes")
+
+    wsock.send_bytes = AsyncMock(side_effect=send_bytes)
+
+    conn = SendspinConnection(server, wsock_client=wsock)
+    conn._transport = wsock  # noqa: SLF001
+    await conn._setup_connection()  # noqa: SLF001
+    conn._writer_task = asyncio.create_task(conn._writer())  # noqa: SLF001
+
+    # Mock a role that handles AUDIO_CHUNK with buffer tracking
+    mock_role = MagicMock()
+    mock_buffer_tracker = MagicMock()
+    mock_buffer_tracker.time_until_duration_capacity.return_value = 0
+    mock_buffer_tracker.time_until_ready.return_value = 0
+    chunk = object()
+
+    def register(*_args: object) -> object:
+        calls.append("register")
+        return chunk
+
+    def finish_transmission(finished: object) -> None:
+        assert finished is chunk
+        calls.append("finish")
+
+    mock_buffer_tracker.register.side_effect = register
+    mock_buffer_tracker.finish_transmission.side_effect = finish_transmission
+    mock_buffer_tracker.capacity_bytes = 100_000
+    mock_role.get_buffer_tracker.return_value = mock_buffer_tracker
+    mock_role.get_output_delay_us.return_value = 0
+    mock_role._stream_start_time_us = None  # noqa: SLF001
+    mock_role._last_late_log_s = 0.0  # noqa: SLF001
+    mock_role._late_skips_since_log = 0  # noqa: SLF001
+    mock_role.get_binary_handling.return_value = BinaryHandling(
+        drop_late=False,
+        buffer_track=True,
+    )
+
+    mock_client = MagicMock()
+    binary_handling = BinaryHandling(drop_late=False, buffer_track=True)
+    mock_client.get_binary_handling_cached.return_value = (binary_handling, mock_role)
+    mock_client.awaits_role_state.return_value = False
+    conn._client = mock_client  # noqa: SLF001
+
+    payload = b"audio_data"
+    message_type = BinaryMessageType.AUDIO_CHUNK.value
+    packed = pack_binary_header_raw(message_type, 0) + payload
+    conn.send_binary(
+        packed,
+        role="player",
+        timestamp_us=0,
+        message_type=message_type,
+        buffer_end_time_us=1_000_000,
+        buffer_byte_count=100,
+        duration_us=50_000,
+    )
+
+    for _ in range(50):
+        if wsock.send_bytes.called:
+            break
+        await asyncio.sleep(0)
+
+    assert wsock.send_bytes.call_count == 1
+    mock_buffer_tracker.time_until_ready.assert_called()
+    mock_buffer_tracker.register.assert_called_once_with(1_000_000, 100, 50_000)
+    assert calls == ["register", "send_bytes", "finish"]
+
+    await conn.disconnect(retry_connection=False)
+
+
+@pytest.mark.asyncio
+async def test_writer_does_not_register_without_metadata() -> None:
+    """Writer should not call register() when metadata is None."""
+    loop = asyncio.get_running_loop()
+    server = _DummyServer(loop=loop, clock=LoopClock(loop))
+
+    wsock = MagicMock()
+    wsock.closed = False
+    wsock.send_str = AsyncMock()
+    wsock.send_bytes = AsyncMock()
+
+    conn = SendspinConnection(server, wsock_client=wsock)
+    conn._transport = wsock  # noqa: SLF001
+    await conn._setup_connection()  # noqa: SLF001
+    conn._writer_task = asyncio.create_task(conn._writer())  # noqa: SLF001
+
+    # Mock a role that handles AUDIO_CHUNK with buffer tracking
+    mock_role = MagicMock()
+    mock_buffer_tracker = MagicMock()
+    mock_buffer_tracker.time_until_duration_capacity.return_value = 0
+    mock_buffer_tracker.time_until_ready.return_value = 0
+    mock_buffer_tracker.capacity_bytes = 100_000
+    mock_role.get_buffer_tracker.return_value = mock_buffer_tracker
+    mock_role.get_output_delay_us.return_value = 0
+    mock_role._stream_start_time_us = None  # noqa: SLF001
+    mock_role._last_late_log_s = 0.0  # noqa: SLF001
+    mock_role._late_skips_since_log = 0  # noqa: SLF001
+
+    mock_client = MagicMock()
+    binary_handling = BinaryHandling(drop_late=False, buffer_track=True)
+    mock_client.get_binary_handling_cached.return_value = (binary_handling, mock_role)
+    mock_client.awaits_role_state.return_value = False
+    conn._client = mock_client  # noqa: SLF001
+
+    payload = b"audio_data"
+    message_type = BinaryMessageType.AUDIO_CHUNK.value
+    packed = pack_binary_header_raw(message_type, 0) + payload
+    conn.send_binary(
+        packed, role="player", timestamp_us=0, message_type=message_type
+    )  # No buffer metadata
+
+    for _ in range(50):
+        if wsock.send_bytes.called:
+            break
+        await asyncio.sleep(0)
+
+    assert wsock.send_bytes.call_count == 1
+    mock_buffer_tracker.register.assert_not_called()
+
+    await conn.disconnect(retry_connection=False)
+
+
+@pytest.mark.asyncio
+async def test_writer_blocks_on_buffer_tracker_capacity() -> None:
+    """Writer should defer sending when buffer tracker reports no capacity."""
+    loop = asyncio.get_running_loop()
+    server = _DummyServer(loop=loop, clock=LoopClock(loop))
+
+    wsock = MagicMock()
+    wsock.closed = False
+    wsock.send_str = AsyncMock()
+    wsock.send_bytes = AsyncMock()
+
+    conn = SendspinConnection(server, wsock_client=wsock)
+    conn._transport = wsock  # noqa: SLF001
+    await conn._setup_connection()  # noqa: SLF001
+    conn._writer_task = asyncio.create_task(conn._writer())  # noqa: SLF001
+
+    mock_role = MagicMock()
+    mock_buffer_tracker = MagicMock()
+    mock_buffer_tracker.time_until_ready.return_value = 1_000_000
+    mock_buffer_tracker.capacity_bytes = 100_000
+    mock_role.get_buffer_tracker.return_value = mock_buffer_tracker
+    mock_role.get_output_delay_us.return_value = 0
+    mock_role._stream_start_time_us = None  # noqa: SLF001
+    mock_role._last_late_log_s = 0.0  # noqa: SLF001
+    mock_role._late_skips_since_log = 0  # noqa: SLF001
+
+    mock_client = MagicMock()
+    binary_handling = BinaryHandling(drop_late=False, buffer_track=True)
+    mock_client.get_binary_handling_cached.return_value = (binary_handling, mock_role)
+    mock_client.awaits_role_state.return_value = False
+    conn._client = mock_client  # noqa: SLF001
+
+    payload = b"audio_data"
+    message_type = BinaryMessageType.AUDIO_CHUNK.value
+    packed = pack_binary_header_raw(message_type, 0) + payload
+    conn.send_binary(
+        packed,
+        role="player",
+        timestamp_us=0,
+        message_type=message_type,
+        buffer_end_time_us=1_000_000,
+        buffer_byte_count=100,
+        duration_us=50_000,
+    )
+
+    # Give writer a chance to process and apply blocking.
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+    assert wsock.send_bytes.call_count == 0
+    mock_buffer_tracker.time_until_ready.assert_called_with(
+        100,
+        50_000,
+        end_time_us=1_000_000,
+    )
+
+    await conn.disconnect(retry_connection=False)
+
+
+@pytest.mark.asyncio
+async def test_drop_pending_binary_unblocks_backpressured_role() -> None:
+    """drop_pending_binary() must immediately release a backpressured role.
+
+    A stream boundary evicts queued audio whose backpressure deadline was
+    computed against now-invalidated state; new-epoch work must be
+    schedulable right away while the stale entry is epoch-discarded.
+    """
+    loop = asyncio.get_running_loop()
+    server = _DummyServer(loop=loop, clock=LoopClock(loop))
+
+    wsock = MagicMock()
+    wsock.closed = False
+    wsock.send_str = AsyncMock()
+    wsock.send_bytes = AsyncMock()
+
+    conn = SendspinConnection(server, wsock_client=wsock)
+    conn._transport = wsock  # noqa: SLF001
+    await conn._setup_connection()  # noqa: SLF001
+    conn._writer_task = asyncio.create_task(conn._writer())  # noqa: SLF001
+
+    mock_role = MagicMock()
+    mock_buffer_tracker = MagicMock()
+    mock_buffer_tracker.time_until_ready.return_value = 1_000_000
+    mock_buffer_tracker.capacity_bytes = 100_000
+    mock_role.get_buffer_tracker.return_value = mock_buffer_tracker
+    mock_role.get_output_delay_us.return_value = 0
+    mock_role._stream_start_time_us = None  # noqa: SLF001
+    mock_role._last_late_log_s = 0.0  # noqa: SLF001
+    mock_role._late_skips_since_log = 0  # noqa: SLF001
+
+    mock_client = MagicMock()
+    binary_handling = BinaryHandling(drop_late=False, buffer_track=True)
+    mock_client.get_binary_handling_cached.return_value = (binary_handling, mock_role)
+    mock_client.awaits_role_state.return_value = False
+    conn._client = mock_client  # noqa: SLF001
+
+    message_type = BinaryMessageType.AUDIO_CHUNK.value
+    conn.send_binary(
+        pack_binary_header_raw(message_type, 0) + b"stale",
+        role="player",
+        timestamp_us=0,
+        message_type=message_type,
+        buffer_end_time_us=1_000_000,
+        buffer_byte_count=100,
+        duration_us=50_000,
+    )
+
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert wsock.send_bytes.call_count == 0
+    assert "player" in conn._blocked_until_us  # noqa: SLF001
+
+    # Stream boundary: evict the queued binary and open capacity.
+    conn.drop_pending_binary(["player"])
+    mock_buffer_tracker.time_until_ready.return_value = 0
+
+    conn.send_binary(
+        pack_binary_header_raw(message_type, 0) + b"fresh",
+        role="player",
+        timestamp_us=0,
+        message_type=message_type,
+        buffer_end_time_us=2_000_000,
+        buffer_byte_count=100,
+        duration_us=50_000,
+    )
+
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+    # The stale entry was epoch-discarded and the new-epoch frame went out
+    # immediately instead of waiting out the old backpressure deadline.
+    assert wsock.send_bytes.call_count == 1
+    assert wsock.send_bytes.call_args[0][0].endswith(b"fresh")
+    assert "player" not in conn._blocked_until_us  # noqa: SLF001
+
+    await conn.disconnect(retry_connection=False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("role", "message_type"),
+    [
+        ("player", BinaryMessageType.AUDIO_CHUNK.value),
+        ("visualizer", BinaryMessageType.VISUALIZATION_LOUDNESS.value),
+    ],
+)
+async def test_writer_drops_chunk_larger_than_buffer_capacity(
+    role: str, message_type: int, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A chunk that can never fit is dropped, warned about once per stream, and not sent."""
+    loop = asyncio.get_running_loop()
+    server = _DummyServer(loop=loop, clock=LoopClock(loop))
+
+    wsock = MagicMock()
+    wsock.closed = False
+    wsock.send_str = AsyncMock()
+    wsock.send_bytes = AsyncMock()
+
+    conn = SendspinConnection(server, wsock_client=wsock)
+    conn._transport = wsock  # noqa: SLF001
+    await conn._setup_connection()  # noqa: SLF001
+    conn._writer_task = asyncio.create_task(conn._writer())  # noqa: SLF001
+
+    tracker = BufferTracker(clock=server.clock, client_id="c", capacity_bytes=100)
+    mock_role = MagicMock()
+    mock_role.get_buffer_tracker.return_value = tracker
+    mock_role.get_output_delay_us.return_value = 0
+    mock_client = MagicMock()
+    binary_handling = BinaryHandling(drop_late=False, buffer_track=True)
+    mock_client.get_binary_handling_cached.return_value = (binary_handling, mock_role)
+    mock_client.awaits_role_state.return_value = False
+    conn._client = mock_client  # noqa: SLF001
+
+    end_time_us = server.clock.now_us() + 10_000_000
+
+    def send(payload: bytes) -> None:
+        conn.send_binary(
+            pack_binary_header_raw(message_type, 0) + payload,
+            role=role,
+            timestamp_us=0,
+            message_type=message_type,
+            buffer_end_time_us=end_time_us,
+            buffer_byte_count=len(payload),
+        )
+
+    async def settle() -> None:
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+    def oversize_warnings() -> int:
+        return sum("larger than the client's buffer capacity" in r.message for r in caplog.records)
+
+    with caplog.at_level(logging.WARNING):
+        send(b"x" * 101)
+        send(b"x" * 101)
+        send(b"y" * 100)
+        await settle()
+
+        # The oversized chunks are gone; the one that exactly fills the buffer is sent.
+        assert [call.args[0][-1:] for call in wsock.send_bytes.call_args_list] == [b"y"]
+        assert tracker.buffered_bytes == 100
+        assert oversize_warnings() == 1
+
+        tracker.reset()
+        send(b"x" * 101)
+        await settle()
+
+    assert wsock.send_bytes.call_count == 1
+    assert oversize_warnings() == 2
+
+    await conn.disconnect(retry_connection=False)
+
+
+@pytest.mark.asyncio
+async def test_enqueue_warns_when_output_delay_makes_chunk_late(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A chunk whose end is still ahead but earlier than the output delay is late at enqueue."""
+    loop = asyncio.get_running_loop()
+    server = _DummyServer(loop=loop, clock=LoopClock(loop))
+    conn = SendspinConnection(server, wsock_client=MagicMock())
+    mock_role = MagicMock()
+    mock_role.get_output_delay_us.return_value = 500_000
+    mock_client = MagicMock()
+    mock_client.get_binary_handling_cached.return_value = (
+        BinaryHandling(drop_late=True),
+        mock_role,
+    )
+    mock_client.awaits_role_state.return_value = False
+    conn._client = mock_client  # noqa: SLF001
+    now_us = server.clock.now_us()
+
+    with caplog.at_level(logging.WARNING):
+        conn.send_binary(
+            b"audio",
+            role="player",
+            timestamp_us=now_us + 200_000,
+            message_type=BinaryMessageType.AUDIO_CHUNK.value,
+            buffer_end_time_us=now_us + 300_000,
+            buffer_byte_count=5,
+            duration_us=100_000,
+        )
+
+    assert any("Enqueued already-late binary" in r.message for r in caplog.records)
+
+
+def test_check_late_binary_uses_player_effective_timestamp() -> None:
+    """Output delay should make late-drop compare against effective play time."""
+    loop = asyncio.new_event_loop()
+    try:
+        clock = ManualClock(now_us_value=10_000_000)
+        server = _DummyServer(loop=loop, clock=clock)
+        wsock = MagicMock()
+        wsock.closed = False
+        conn = SendspinConnection(server, wsock_client=wsock)
+        conn._transport = wsock  # noqa: SLF001
+
+        role = PlayerV1Role(client=_make_player_client_stub())
+        role.output_delay_ms = 5_000
+        role._stream_start_time_us = 0  # noqa: SLF001
+
+        handling = BinaryHandling(drop_late=True, grace_period_us=2_000_000)
+
+        # Raw timestamp is still 4s in the future, but effective play time is 1s in the past.
+        entry = _RoleQueueEntry(epoch=0, timestamp_us=14_000_000)
+        assert conn._check_late_binary(handling, role, entry) is True  # noqa: SLF001
+    finally:
+        loop.close()
+
+
+def test_check_late_binary_drops_past_due_player_chunk_at_stream_start() -> None:
+    """A player chunk that aged past its play time is dropped even right after stream start."""
+    loop = asyncio.new_event_loop()
+    try:
+        clock = ManualClock(now_us_value=10_000_000)
+        server = _DummyServer(loop=loop, clock=clock)
+        wsock = MagicMock()
+        wsock.closed = False
+        conn = SendspinConnection(server, wsock_client=wsock)
+        conn._transport = wsock  # noqa: SLF001
+
+        role = PlayerV1Role(client=_make_player_client_stub())
+        handling = role.get_binary_handling(BinaryMessageType.AUDIO_CHUNK.value)
+
+        entry = _RoleQueueEntry(epoch=0, timestamp_us=9_900_000)
+        assert conn._check_late_binary(handling, role, entry) is True  # noqa: SLF001
+    finally:
+        loop.close()
+
+
+@pytest.mark.asyncio
+async def test_server_initiated_connection_starts_writer_task() -> None:
+    """Server-initiated connections must start a writer task so enqueued messages are sent."""
+    loop = asyncio.get_running_loop()
+    server = _DummyServer(loop=loop, clock=LoopClock(loop))
+
+    wsock = MagicMock()
+    wsock.closed = False
+    wsock.send_str = AsyncMock()
+    wsock.send_bytes = AsyncMock()
+
+    conn = SendspinConnection(server, wsock_client=wsock)
+    conn._transport = wsock  # noqa: SLF001
+    await conn._setup_connection()  # noqa: SLF001
+    conn._writer_task = asyncio.create_task(conn._writer())  # noqa: SLF001
+    assert conn._writer_task is not None  # noqa: SLF001
+
+    conn.send_message(
+        ServerTimeMessage(
+            payload=ServerTimePayload(
+                client_transmitted=1,
+                server_received=2,
+                server_transmitted=3,
+            )
+        )
+    )
+
+    for _ in range(50):
+        if wsock.send_str.called:
+            break
+        await asyncio.sleep(0)
+
+    assert wsock.send_str.call_count == 1
+
+    await conn.disconnect(retry_connection=False)
+
+
+@pytest.mark.asyncio
+async def test_role_stream_start_is_sent_before_binary_for_same_role() -> None:
+    """Role-scoped stream/start must not be overtaken by timed binary for that role."""
+    loop = asyncio.get_running_loop()
+    server = _DummyServer(loop=loop, clock=LoopClock(loop))
+
+    send_order: list[str] = []
+
+    async def _record_json(_payload: str) -> None:
+        send_order.append("json")
+
+    async def _record_binary(_payload: bytes) -> None:
+        send_order.append("binary")
+
+    wsock = MagicMock()
+    wsock.closed = False
+    wsock.send_str = AsyncMock(side_effect=_record_json)
+    wsock.send_bytes = AsyncMock(side_effect=_record_binary)
+
+    conn = SendspinConnection(server, wsock_client=wsock)
+    conn._transport = wsock  # noqa: SLF001
+    await conn._setup_connection()  # noqa: SLF001
+    conn._writer_task = asyncio.create_task(conn._writer())  # noqa: SLF001
+
+    conn.send_role_message(
+        "player",
+        StreamStartMessage(
+            payload=StreamStartPayload(
+                player=StreamStartPlayer(
+                    codec=AudioCodec.PCM,
+                    sample_rate=44_100,
+                    channels=2,
+                    bit_depth=16,
+                    codec_header=None,
+                )
+            )
+        ),
+    )
+    conn.send_binary(
+        pack_binary_header_raw(BinaryMessageType.AUDIO_CHUNK.value, 123_456) + b"audio",
+        role="player",
+        timestamp_us=123_456,
+        message_type=BinaryMessageType.AUDIO_CHUNK.value,
+    )
+
+    for _ in range(50):
+        if len(send_order) >= 2:
+            break
+        await asyncio.sleep(0)
+
+    assert send_order[:2] == ["json", "binary"]
+
+    await conn.disconnect(retry_connection=False)
+
+
+@pytest.mark.asyncio
+async def test_role_stream_lifecycle_json_is_sent_before_older_binary() -> None:
+    """Binary with older playback ts must not overtake queued stream lifecycle JSON."""
+    loop = asyncio.get_running_loop()
+    server = _DummyServer(loop=loop, clock=LoopClock(loop))
+
+    send_order: list[str] = []
+
+    async def _record_json(_payload: str) -> None:
+        send_order.append("json")
+
+    async def _record_binary(_payload: bytes) -> None:
+        send_order.append("binary")
+
+    wsock = MagicMock()
+    wsock.closed = False
+    wsock.send_str = AsyncMock(side_effect=_record_json)
+    wsock.send_bytes = AsyncMock(side_effect=_record_binary)
+
+    conn = SendspinConnection(server, wsock_client=wsock)
+    conn._transport = wsock  # noqa: SLF001
+    await conn._setup_connection()  # noqa: SLF001
+    conn._writer_task = asyncio.create_task(conn._writer())  # noqa: SLF001
+    conn._streaming_roles.add("player")  # noqa: SLF001
+
+    conn.send_role_message("player", StreamEndMessage(payload=StreamEndPayload(roles=None)))
+    conn.send_role_message(
+        "player",
+        StreamStartMessage(
+            payload=StreamStartPayload(
+                player=StreamStartPlayer(
+                    codec=AudioCodec.PCM,
+                    sample_rate=44_100,
+                    channels=2,
+                    bit_depth=16,
+                    codec_header=None,
+                )
+            )
+        ),
+    )
+    # Timestamp intentionally older than stream lifecycle sort timestamp.
+    conn.send_binary(
+        pack_binary_header_raw(BinaryMessageType.AUDIO_CHUNK.value, 1) + b"audio",
+        role="player",
+        timestamp_us=1,
+        message_type=BinaryMessageType.AUDIO_CHUNK.value,
+    )
+
+    for _ in range(50):
+        if len(send_order) >= 3:
+            break
+        await asyncio.sleep(0)
+
+    assert send_order[:3] == ["json", "json", "binary"]
+
+    await conn.disconnect(retry_connection=False)
+
+
+@pytest.mark.asyncio
+async def test_in_place_stream_start_follows_queued_binary() -> None:
+    """A stream/start for an active stream must not overtake that role's queued audio."""
+    loop = asyncio.get_running_loop()
+    clock = LoopClock(loop)
+    server = _DummyServer(loop=loop, clock=clock)
+
+    send_order: list[str] = []
+
+    async def _record_json(_payload: str) -> None:
+        send_order.append("json")
+
+    async def _record_binary(_payload: bytes) -> None:
+        send_order.append("binary")
+
+    wsock = MagicMock()
+    wsock.closed = False
+    wsock.send_str = AsyncMock(side_effect=_record_json)
+    wsock.send_bytes = AsyncMock(side_effect=_record_binary)
+
+    conn = SendspinConnection(server, wsock_client=wsock)
+    conn._transport = wsock  # noqa: SLF001
+    await conn._setup_connection()  # noqa: SLF001
+    conn._writer_task = asyncio.create_task(conn._writer())  # noqa: SLF001
+
+    timestamp_us = clock.now_us() + 2_000_000
+    conn.send_binary(
+        pack_binary_header_raw(BinaryMessageType.AUDIO_CHUNK.value, timestamp_us) + b"audio",
+        role="player",
+        timestamp_us=timestamp_us,
+        message_type=BinaryMessageType.AUDIO_CHUNK.value,
+    )
+    conn.send_role_message(
+        "player",
+        StreamStartMessage(
+            payload=StreamStartPayload(
+                player=StreamStartPlayer(
+                    codec=AudioCodec.PCM,
+                    sample_rate=44_100,
+                    channels=2,
+                    bit_depth=16,
+                    codec_header=None,
+                )
+            )
+        ),
+    )
+
+    for _ in range(50):
+        if len(send_order) >= 2:
+            break
+        await asyncio.sleep(0)
+
+    assert send_order[:2] == ["binary", "json"]
+
+    await conn.disconnect(retry_connection=False)
+
+
+@pytest.mark.parametrize(
+    "queue_control",
+    [
+        pytest.param(
+            lambda conn: conn.send_message(
+                ServerCommandMessage(
+                    payload=ServerCommandPayload(
+                        player=PlayerCommandPayload(command=PlayerCommand.VOLUME, volume=40)
+                    )
+                )
+            ),
+            id="player_command",
+        ),
+        pytest.param(
+            lambda conn: conn.send_role_message(
+                "metadata", _state(metadata=SessionUpdateMetadata(timestamp=1, title="Song"))
+            ),
+            id="metadata_state",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_control_message_is_sent_before_remaining_ready_audio(
+    queue_control: Callable[[SendspinConnection], None],
+) -> None:
+    """A control message queued while player audio is ready goes out before that audio."""
+    loop = asyncio.get_running_loop()
+    clock = LoopClock(loop)
+    server = _DummyServer(loop=loop, clock=clock)
+
+    send_order: list[str] = []
+    conn: SendspinConnection
+
+    async def _record_json(_payload: str) -> None:
+        send_order.append("json")
+
+    async def _record_binary(_payload: bytes) -> None:
+        send_order.append("binary")
+        if len(send_order) == 1:
+            queue_control(conn)
+
+    wsock = MagicMock()
+    wsock.closed = False
+    wsock.send_str = AsyncMock(side_effect=_record_json)
+    wsock.send_bytes = AsyncMock(side_effect=_record_binary)
+
+    conn = SendspinConnection(server, wsock_client=wsock)
+    conn._transport = wsock  # noqa: SLF001
+    await conn._setup_connection()  # noqa: SLF001
+
+    for index in range(3):
+        timestamp_us = clock.now_us() + 2_000_000 + index * 25_000
+        conn.send_binary(
+            pack_binary_header_raw(BinaryMessageType.AUDIO_CHUNK.value, timestamp_us) + b"audio",
+            role="player",
+            timestamp_us=timestamp_us,
+            message_type=BinaryMessageType.AUDIO_CHUNK.value,
+        )
+    conn._writer_task = asyncio.create_task(conn._writer())  # noqa: SLF001
+
+    for _ in range(50):
+        if len(send_order) >= 4:
+            break
+        await asyncio.sleep(0)
+
+    assert send_order == ["binary", "json", "binary", "binary"]
+
+    await conn.disconnect(retry_connection=False)
+
+
+@pytest.mark.asyncio
+async def test_writer_rewrites_server_transmitted_at_send_time() -> None:
+    """`server/time` must carry the clock value at actual send, not at enqueue."""
+    loop = asyncio.get_running_loop()
+    clock = ManualClock(now_us_value=1_000_000)
+    server = _DummyServer(loop=loop, clock=clock)
+
+    sent_json: list[str] = []
+
+    async def _record_json(payload: str) -> None:
+        sent_json.append(payload)
+
+    wsock = MagicMock()
+    wsock.closed = False
+    wsock.send_str = AsyncMock(side_effect=_record_json)
+    wsock.send_bytes = AsyncMock()
+
+    conn = SendspinConnection(server, wsock_client=wsock)
+    conn._transport = wsock  # noqa: SLF001
+    await conn._setup_connection()  # noqa: SLF001
+    conn._writer_task = asyncio.create_task(conn._writer())  # noqa: SLF001
+
+    conn.send_message(
+        ServerTimeMessage(
+            payload=ServerTimePayload(
+                client_transmitted=11,
+                server_received=22,
+                server_transmitted=0,
+            )
+        )
+    )
+
+    # Simulate enqueue-to-send latency before the writer drains the queue.
+    clock.advance_us(750_000)
+
+    for _ in range(50):
+        if sent_json:
+            break
+        await asyncio.sleep(0)
+
+    assert len(sent_json) == 1
+    payload = json.loads(sent_json[0])["payload"]
+    assert payload["client_transmitted"] == 11
+    assert payload["server_received"] == 22
+    assert payload["server_transmitted"] == 1_750_000
+
+    await conn.disconnect(retry_connection=False)
+
+
+@pytest.mark.asyncio
+async def test_send_message_stream_end_omits_server_transmitted() -> None:
+    """stream/end goes out with its roles and without a server_transmitted timestamp."""
+    loop = asyncio.get_running_loop()
+    clock = ManualClock(now_us_value=5_000_000)
+    server = _DummyServer(loop=loop, clock=clock)
+
+    sent: list[str] = []
+    wsock = MagicMock()
+    wsock.closed = False
+    wsock.send_str = AsyncMock(side_effect=sent.append)
+
+    conn = SendspinConnection(server, wsock_client=wsock)
+
+    await conn._send_message(  # noqa: SLF001
+        wsock, StreamEndMessage(payload=StreamEndPayload(roles=["player"]))
+    )
+
+    payload = json.loads(sent[0])["payload"]
+    assert payload == {"roles": ["player"]}
+
+
+def _json_recording_connection() -> tuple[SendspinConnection, MagicMock, list[str]]:
+    server = _DummyServer(loop=asyncio.get_running_loop(), clock=ManualClock())
+    sent: list[str] = []
+    wsock = MagicMock()
+    wsock.closed = False
+    wsock.send_str = AsyncMock(side_effect=sent.append)
+    return SendspinConnection(server, wsock_client=wsock), wsock, sent
+
+
+def _player_stream_start() -> StreamStartMessage:
+    return StreamStartMessage(
+        payload=StreamStartPayload(
+            player=StreamStartPlayer(
+                codec=AudioCodec.PCM, sample_rate=48_000, channels=2, bit_depth=16
+            )
+        )
+    )
+
+
+async def _drain_role_queues(conn: SendspinConnection, wsock: MagicMock) -> None:
+    while ready := conn._peek_ready_entry():  # noqa: SLF001
+        await conn._process_role_messages(wsock, ready, 0)  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_stream_end_supersedes_queued_stream_start_and_clear() -> None:
+    """A stream/start or stream/clear queued ahead in time does not follow the stream/end."""
+    conn, wsock, sent = _json_recording_connection()
+    conn._streaming_roles.add("player")  # noqa: SLF001
+    conn.send_binary(
+        b"audio",
+        role="player",
+        timestamp_us=5_000_000,
+        message_type=BinaryMessageType.AUDIO_CHUNK.value,
+    )
+    conn.send_role_message("player", _player_stream_start())
+    conn.send_role_message(
+        "player", StreamClearMessage(payload=StreamClearPayload(roles=["player"]))
+    )
+    conn.send_role_message("player", StreamEndMessage(payload=StreamEndPayload(roles=["player"])))
+
+    await _drain_role_queues(conn, wsock)
+
+    assert [json.loads(message)["type"] for message in sent] == ["stream/end"]
+
+
+@pytest.mark.asyncio
+async def test_stream_end_queued_while_stream_start_is_sending_is_kept() -> None:
+    """A stream/start already being written counts as sent for a following stream/end."""
+    conn, wsock, sent = _json_recording_connection()
+    release = asyncio.Event()
+
+    async def _blocking_send(data: str) -> None:
+        await release.wait()
+        sent.append(data)
+
+    wsock.send_str = AsyncMock(side_effect=_blocking_send)
+    conn.send_role_message("player", _player_stream_start())
+    ready = conn._peek_ready_entry()  # noqa: SLF001
+    assert ready is not None
+    sending = asyncio.create_task(conn._process_role_messages(wsock, ready, 0))  # noqa: SLF001
+    await asyncio.sleep(0)
+
+    conn.send_role_message("player", StreamEndMessage(payload=StreamEndPayload(roles=["player"])))
+    release.set()
+    await sending
+    await _drain_role_queues(conn, wsock)
+
+    assert [json.loads(message)["type"] for message in sent] == ["stream/start", "stream/end"]
+
+
+@pytest.mark.asyncio
+async def test_stream_end_for_an_unsent_stream_start_sends_neither() -> None:
+    """Ending a stream whose opening stream/start is still queued puts nothing on the wire."""
+    conn, wsock, sent = _json_recording_connection()
+    conn.send_role_message("player", _player_stream_start())
+    conn.send_role_message("player", StreamEndMessage(payload=StreamEndPayload(roles=["player"])))
+
+    await _drain_role_queues(conn, wsock)
+
+    assert sent == []
+
+
+# DEPRECATED(spec-pr-175): remove in aiosendspin <version>
+@pytest.mark.parametrize(
+    ("key", "role_object", "expected"),
+    [
+        (
+            "metadata",
+            SessionUpdateMetadata(timestamp=1, title="Song"),
+            {
+                "timestamp": 1,
+                "title": "Song",
+                "artist": None,
+                "album_artist": None,
+                "album": None,
+                "artwork_url": None,
+                "year": None,
+                "track": None,
+                "progress": None,
+            },
+        ),
+        (
+            "color",
+            SessionUpdateColor(timestamp=1, primary=(1, 2, 3)),
+            {
+                "timestamp": 1,
+                "background_dark": None,
+                "background_light": None,
+                "primary": [1, 2, 3],
+                "accent": None,
+                "on_dark": None,
+                "on_light": None,
+            },
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_legacy_connection_gets_unset_state_fields_as_null(
+    key: str,
+    role_object: SessionUpdateColor | SessionUpdateMetadata,
+    expected: dict[str, object],
+) -> None:
+    """A legacy connection, which merges role objects, gets every unset field as null."""
+    conn, wsock, sent = _json_recording_connection()
+    conn._legacy_hello = True  # noqa: SLF001
+
+    await conn._send_message(wsock, _state(**{key: role_object}))  # noqa: SLF001
+
+    assert json.loads(sent[0])["payload"] == {key: expected}
+
+
+@pytest.mark.asyncio
+async def test_current_connection_gets_unset_state_fields_omitted() -> None:
+    """A current-spec connection gets the full role object with unset fields omitted."""
+    conn, wsock, sent = _json_recording_connection()
+    conn._noise_psk = MagicMock()  # noqa: SLF001
+
+    await conn._send_message(  # noqa: SLF001
+        wsock, _state(metadata=SessionUpdateMetadata(timestamp=1, title="Song"))
+    )
+
+    assert json.loads(sent[0])["payload"] == {"metadata": {"timestamp": 1, "title": "Song"}}
+
+
+@pytest.mark.asyncio
+async def test_send_binary_disconnects_on_per_role_queue_overflow() -> None:
+    """Per-role queue overflow should trigger disconnect."""
+    loop = asyncio.get_running_loop()
+    server = _DummyServer(loop=loop, clock=LoopClock(loop))
+
+    wsock = MagicMock()
+    wsock.closed = False
+
+    conn = SendspinConnection(server, wsock_client=wsock)
+    conn._transport = wsock  # noqa: SLF001
+    conn._max_pending_msg_by_role["player"] = 1  # noqa: SLF001
+    conn.disconnect = AsyncMock()  # type: ignore[method-assign]
+
+    conn.send_binary(
+        b"frame-1",
+        role="player",
+        timestamp_us=0,
+        message_type=BinaryMessageType.AUDIO_CHUNK.value,
+    )
+    conn.send_binary(
+        b"frame-2",
+        role="player",
+        timestamp_us=25_000,
+        message_type=BinaryMessageType.AUDIO_CHUNK.value,
+    )
+
+    await asyncio.sleep(0)
+
+    assert conn.disconnect.call_count == 1  # type: ignore[attr-defined]
+
+
+def test_priority_message_queue_cap_uses_own_length() -> None:
+    """Priority queue cap should ignore unrelated role-queue bytes in `_queue_size`."""
+    loop = asyncio.new_event_loop()
+    try:
+        server = _DummyServer(loop=loop, clock=LoopClock(loop))
+        wsock = MagicMock()
+        wsock.closed = False
+        conn = SendspinConnection(server, wsock_client=wsock)
+        conn.disconnect = AsyncMock()  # type: ignore[method-assign]
+
+        # Simulate saturated role queues: aggregate _queue_size above the priority cap
+        # without putting anything into _priority_messages itself.
+        conn._queue_size = MAX_PENDING_MSG * 2  # noqa: SLF001
+
+        conn.send_priority_message(
+            ServerTimeMessage(
+                payload=ServerTimePayload(
+                    client_transmitted=1,
+                    server_received=2,
+                    server_transmitted=0,
+                )
+            )
+        )
+
+        assert conn.disconnect.call_count == 0  # type: ignore[attr-defined]
+        assert len(conn._priority_messages) == 1  # noqa: SLF001
+    finally:
+        loop.close()
+
+
+def test_per_role_queue_limit_is_isolated_between_roles() -> None:
+    """One saturated role queue should not block enqueueing another role."""
+    loop = asyncio.new_event_loop()
+    try:
+        server = _DummyServer(loop=loop, clock=LoopClock(loop))
+        wsock = MagicMock()
+        wsock.closed = False
+        conn = SendspinConnection(server, wsock_client=wsock)
+        conn._transport = wsock  # noqa: SLF001
+        conn.disconnect = AsyncMock()  # type: ignore[method-assign]
+        conn._max_pending_msg_by_role["player"] = 1  # noqa: SLF001
+        conn._max_pending_msg_by_role["visualizer"] = 1  # noqa: SLF001
+
+        conn.send_binary(
+            b"player-frame",
+            role="player",
+            timestamp_us=0,
+            message_type=BinaryMessageType.AUDIO_CHUNK.value,
+        )
+        conn.send_binary(
+            b"visualizer-frame",
+            role="visualizer",
+            timestamp_us=0,
+            message_type=BinaryMessageType.AUDIO_CHUNK.value,
+        )
+
+        assert len(conn._role_queues["player"]) == 1  # noqa: SLF001
+        assert len(conn._role_queues["visualizer"]) == 1  # noqa: SLF001
+        assert conn.disconnect.call_count == 0  # type: ignore[attr-defined]
+    finally:
+        loop.close()
+
+
+def _make_connection_with_droppable_client(
+    clock: ManualClock, loop: asyncio.AbstractEventLoop, *, drop_late: bool = True
+) -> SendspinConnection:
+    server = _DummyServer(loop=loop, clock=clock)
+    wsock = MagicMock()
+    wsock.closed = False
+    conn = SendspinConnection(server, wsock_client=wsock)
+    conn._transport = wsock  # noqa: SLF001
+    client = MagicMock()
+    client.active_roles = []
+    client.awaits_role_state.return_value = False
+    role = MagicMock()
+    role.get_output_delay_us.return_value = 0
+    client.get_binary_handling_cached.return_value = (
+        BinaryHandling(drop_late=drop_late, grace_period_us=2_000_000),
+        role,
+    )
+    conn._client = client  # noqa: SLF001
+    return conn
+
+
+def test_send_binary_warns_when_chunk_already_past_deadline(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Enqueuing a droppable chunk whose play window fully passed warns immediately."""
+    loop = asyncio.new_event_loop()
+    try:
+        clock = ManualClock(now_us_value=10_000_000)
+        conn = _make_connection_with_droppable_client(clock, loop)
+
+        with (
+            caplog.at_level(logging.WARNING),
+            patch("aiosendspin.server.connection.time.monotonic", return_value=5.0),
+        ):
+            conn.send_binary(
+                b"audio",
+                role="player",
+                timestamp_us=8_000_000,
+                message_type=BinaryMessageType.AUDIO_CHUNK.value,
+                duration_us=25_000,
+            )
+
+        assert "Enqueued already-late binary" in caplog.text
+        assert "behind_by_us=2000000" in caplog.text
+    finally:
+        loop.close()
+
+
+def test_send_binary_no_doomed_warning_without_drop_late(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Past timestamps on non-droppable message types are not flagged."""
+    loop = asyncio.new_event_loop()
+    try:
+        clock = ManualClock(now_us_value=10_000_000)
+        conn = _make_connection_with_droppable_client(clock, loop, drop_late=False)
+
+        with caplog.at_level(logging.WARNING):
+            conn.send_binary(
+                b"data",
+                role="visualizer",
+                timestamp_us=8_000_000,
+                message_type=BinaryMessageType.AUDIO_CHUNK.value,
+                duration_us=25_000,
+            )
+
+        assert "Enqueued already-late binary" not in caplog.text
+    finally:
+        loop.close()
+
+
+def test_late_binary_warning_reports_regime_diagnostics(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The late-drop warning includes enqueue lead, queue age and stream elapsed time."""
+    loop = asyncio.new_event_loop()
+    try:
+        clock = ManualClock(now_us_value=10_000_000)
+        server = _DummyServer(loop=loop, clock=clock)
+        wsock = MagicMock()
+        wsock.closed = False
+        conn = SendspinConnection(server, wsock_client=wsock)
+        conn._transport = wsock  # noqa: SLF001
+
+        role = PlayerV1Role(client=_make_player_client_stub())
+        role._stream_start_time_us = 0  # noqa: SLF001
+        handling = BinaryHandling(drop_late=True, grace_period_us=2_000_000)
+
+        entry = _RoleQueueEntry(epoch=0, timestamp_us=9_000_000, enqueued_at_us=8_500_000)
+        with caplog.at_level(logging.WARNING):
+            assert conn._check_late_binary(handling, role, entry) is True  # noqa: SLF001
+
+        assert "enq_lead_ms=500" in caplog.text
+        assert "queue_age_ms=1500" in caplog.text
+        assert "stream_elapsed_s=10.0" in caplog.text
+        # This role has no buffer tracker, so the buffer fields are left out
+        # rather than reported as placeholder values.
+        assert "buf_ms" not in caplog.text
+    finally:
+        loop.close()
+
+
+def test_late_binary_warning_reports_buffer_state_when_tracked(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """With a buffer tracker present the warning reports the device buffer state."""
+    loop = asyncio.new_event_loop()
+    try:
+        clock = ManualClock(now_us_value=10_000_000)
+        server = _DummyServer(loop=loop, clock=clock)
+        wsock = MagicMock()
+        wsock.closed = False
+        conn = SendspinConnection(server, wsock_client=wsock)
+        conn._transport = wsock  # noqa: SLF001
+
+        role = PlayerV1Role(client=_make_player_client_stub())
+        role._stream_start_time_us = 0  # noqa: SLF001
+        tracker = BufferTracker(
+            clock=clock, client_id="p", capacity_bytes=200_000, max_duration_us=30_000_000
+        )
+        tracker.register(12_000_000, 4_000, 25_000)
+        role._state().buffer_tracker = tracker  # noqa: SLF001
+
+        entry = _RoleQueueEntry(epoch=0, timestamp_us=9_000_000, enqueued_at_us=8_500_000)
+        handling = BinaryHandling(drop_late=True, grace_period_us=2_000_000)
+        with caplog.at_level(logging.WARNING):
+            assert conn._check_late_binary(handling, role, entry) is True  # noqa: SLF001
+
+        assert "buf_ms=2000" in caplog.text
+        assert "buf_bytes=4000/200000" in caplog.text
+    finally:
+        loop.close()
+
+
+def test_late_binary_warning_is_throttled_across_a_burst(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A burst of late chunks yields one warning that carries the suppressed count."""
+    loop = asyncio.new_event_loop()
+    try:
+        clock = ManualClock(now_us_value=10_000_000)
+        server = _DummyServer(loop=loop, clock=clock)
+        wsock = MagicMock()
+        wsock.closed = False
+        conn = SendspinConnection(server, wsock_client=wsock)
+        conn._transport = wsock  # noqa: SLF001
+
+        role = PlayerV1Role(client=_make_player_client_stub())
+        role._stream_start_time_us = 0  # noqa: SLF001
+        handling = BinaryHandling(drop_late=True, grace_period_us=2_000_000)
+
+        with (
+            caplog.at_level(logging.WARNING),
+            patch("aiosendspin.server.connection.time.monotonic", return_value=5.0),
+        ):
+            for _ in range(5):
+                entry = _RoleQueueEntry(epoch=0, timestamp_us=9_000_000, enqueued_at_us=8_500_000)
+                assert conn._check_late_binary(handling, role, entry) is True  # noqa: SLF001
+
+        assert caplog.text.count("Late binary") == 1
+        # The suppressed drops still accumulate for the next warning to report.
+        assert role._late_skips_since_log == 4  # noqa: SLF001
+    finally:
+        loop.close()
+
+
+def test_late_binary_diagnostics_use_the_effective_play_time(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A output delay shifts the deadline, so enq_lead must agree with late_by_us."""
+    loop = asyncio.new_event_loop()
+    try:
+        clock = ManualClock(now_us_value=10_000_000)
+        server = _DummyServer(loop=loop, clock=clock)
+        wsock = MagicMock()
+        wsock.closed = False
+        conn = SendspinConnection(server, wsock_client=wsock)
+        conn._transport = wsock  # noqa: SLF001
+
+        role = PlayerV1Role(client=_make_player_client_stub())
+        role._stream_start_time_us = 0  # noqa: SLF001
+        role.output_delay_ms = 5_000
+
+        # Raw timestamp is 4s ahead, but the effective play time is 1s in the past.
+        entry = _RoleQueueEntry(epoch=0, timestamp_us=14_000_000, enqueued_at_us=9_500_000)
+        handling = BinaryHandling(drop_late=True, grace_period_us=2_000_000)
+        with caplog.at_level(logging.WARNING):
+            assert conn._check_late_binary(handling, role, entry) is True  # noqa: SLF001
+
+        # Reported against the same deadline as late_by_us, not the raw timestamp
+        # (which would have claimed a healthy +4500ms lead for a late chunk).
+        assert "enq_lead_ms=-500" in caplog.text
+        assert "late_by_us=1000000" in caplog.text
+    finally:
+        loop.close()
+
+
+@pytest.mark.asyncio
+async def test_first_slow_send_warns_soon_after_boot(caplog: pytest.LogCaptureFixture) -> None:
+    """A stalled write warns even when the monotonic clock is still under the warn interval."""
+    now_s = [5.0]
+
+    async def _stalled_send(_payload: bytes) -> None:
+        now_s[0] += 0.6
+
+    wsock = MagicMock()
+    wsock.closed = False
+    wsock.send_bytes = AsyncMock(side_effect=_stalled_send)
+    conn = SendspinConnection(
+        _DummyServer(loop=asyncio.get_running_loop(), clock=ManualClock(now_us_value=0)),
+        wsock_client=wsock,
+    )
+    binary = _BinaryData(data=b"x", message_type=BinaryMessageType.AUDIO_CHUNK.value)
+    entry = _RoleQueueEntry(epoch=0, timestamp_us=0, binary=binary)
+
+    with (
+        caplog.at_level(logging.WARNING),
+        patch("aiosendspin.server.connection.time.monotonic", side_effect=lambda: now_s[0]),
+    ):
+        await conn._send_binary_data(wsock, "player", entry, None)  # noqa: SLF001
+
+    assert "Slow send_bytes" in caplog.text
+
+
+async def _start_recording_connection(
+    server: _DummyServer,
+) -> tuple[SendspinConnection, list[bytes]]:
+    sent: list[bytes] = []
+
+    async def _record_binary(payload: bytes) -> None:
+        sent.append(payload)
+
+    wsock = MagicMock()
+    wsock.closed = False
+    wsock.send_str = AsyncMock()
+    wsock.send_bytes = AsyncMock(side_effect=_record_binary)
+
+    conn = SendspinConnection(server, wsock_client=wsock)
+    conn._transport = wsock  # noqa: SLF001
+    await conn._setup_connection()  # noqa: SLF001
+    return conn, sent
+
+
+async def _drain_one(conn: SendspinConnection, sent: list[bytes]) -> None:
+    expected = len(sent) + 1
+    if conn._writer_task is None:  # noqa: SLF001
+        conn._writer_task = asyncio.create_task(conn._writer())  # noqa: SLF001
+    for _ in range(50):
+        if len(sent) >= expected:
+            return
+        await asyncio.sleep(0)
+
+
+def _send_player_audio(conn: SendspinConnection, payload: bytes, timestamp_us: int) -> None:
+    conn.send_binary(
+        payload,
+        role="player",
+        timestamp_us=timestamp_us,
+        message_type=BinaryMessageType.AUDIO_CHUNK.value,
+        player_audio_header=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("timestamp_us", "expected_send_ahead"),
+    [
+        (1_900_000, 150_000),
+        (1_750_000, 0),
+        (1_000_000, 0),
+        (1_750_000 + SEND_AHEAD_MAX + 1, SEND_AHEAD_MAX),
+    ],
+)
+@pytest.mark.asyncio
+async def test_writer_stamps_player_audio_send_ahead_at_send_time(
+    timestamp_us: int, expected_send_ahead: int
+) -> None:
+    """The 13-byte audio header carries send_ahead from the send-time clock, saturated."""
+    # No client is attached, so late-drop never discards the past-timestamp cases.
+    clock = ManualClock(now_us_value=1_000_000)
+    conn, sent = await _start_recording_connection(
+        _DummyServer(loop=asyncio.get_running_loop(), clock=clock)
+    )
+
+    _send_player_audio(conn, b"audio", timestamp_us)
+    # Simulate enqueue-to-send latency before the writer drains the queue.
+    clock.advance_us(750_000)
+    await _drain_one(conn, sent)
+
+    assert len(sent) == 1
+    # The Noise transport only encrypts bytes.
+    assert type(sent[0]) is bytes
+    assert len(sent[0]) == PLAYER_AUDIO_HEADER_SIZE + len(b"audio")
+    header = unpack_player_audio_header(sent[0])
+    assert header.message_type == BinaryMessageType.AUDIO_CHUNK.value
+    assert header.timestamp_us == timestamp_us
+    assert header.send_ahead == expected_send_ahead
+    assert sent[0][PLAYER_AUDIO_HEADER_SIZE:] == b"audio"
+
+    await conn.disconnect(retry_connection=False)
+
+
+@pytest.mark.asyncio
+async def test_writer_reads_send_ahead_clock_after_building_the_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Time spent building the frame is excluded from send_ahead."""
+    clock = ManualClock(now_us_value=1_000_000)
+    conn, sent = await _start_recording_connection(
+        _DummyServer(loop=asyncio.get_running_loop(), clock=clock)
+    )
+
+    def _slow_pack(timestamp_us: int, payload: bytes) -> bytearray:
+        clock.advance_us(100_000)
+        return pack_player_audio_frame(timestamp_us, payload)
+
+    monkeypatch.setattr(connection_module, "pack_player_audio_frame", _slow_pack)
+    _send_player_audio(conn, b"audio", 1_500_000)
+    await _drain_one(conn, sent)
+
+    assert unpack_player_audio_header(sent[0]).send_ahead == 400_000
+
+    await conn.disconnect(retry_connection=False)
+
+
+@pytest.mark.asyncio
+async def test_shared_audio_chunk_gets_a_header_per_connection() -> None:
+    """Connections sending one AudioChunk each stamp their own header on an untouched payload."""
+    loop = asyncio.get_running_loop()
+    clock = ManualClock(now_us_value=1_000_000)
+    conn_a, sent_a = await _start_recording_connection(_DummyServer(loop=loop, clock=clock))
+    conn_b, sent_b = await _start_recording_connection(_DummyServer(loop=loop, clock=clock))
+    chunk = AudioChunk(data=b"shared", timestamp_us=1_500_000, duration_us=25_000, byte_count=6)
+
+    _send_player_audio(conn_a, chunk.data, chunk.timestamp_us)
+    _send_player_audio(conn_b, chunk.data, chunk.timestamp_us)
+    await _drain_one(conn_a, sent_a)
+    clock.advance_us(200_000)
+    await _drain_one(conn_b, sent_b)
+
+    assert unpack_player_audio_header(sent_a[0]).send_ahead == 500_000
+    assert unpack_player_audio_header(sent_b[0]).send_ahead == 300_000
+    assert sent_a[0][PLAYER_AUDIO_HEADER_SIZE:] == b"shared"
+    assert sent_b[0][PLAYER_AUDIO_HEADER_SIZE:] == b"shared"
+
+    await conn_a.disconnect(retry_connection=False)
+    await conn_b.disconnect(retry_connection=False)
+
+
+# DEPRECATED(spec-pr-167): remove in aiosendspin <version>
+@pytest.mark.asyncio
+async def test_pre_spec_177_connection_gets_nine_byte_audio_header() -> None:
+    """A connection whose hello used the pre-#177 shape gets the header without send_ahead."""
+    clock = ManualClock(now_us_value=1_000_000)
+    conn, sent = await _start_recording_connection(
+        _DummyServer(loop=asyncio.get_running_loop(), clock=clock)
+    )
+    conn._legacy_hello = True  # noqa: SLF001
+
+    _send_player_audio(conn, b"audio", 1_500_000)
+    await _drain_one(conn, sent)
+
+    assert sent == [
+        pack_binary_header_raw(BinaryMessageType.AUDIO_CHUNK.value, 1_500_000) + b"audio"
+    ]
+
+    await conn.disconnect(retry_connection=False)
+
+
+@pytest.mark.parametrize(
+    "message_type",
+    [BinaryMessageType.ARTWORK_CHANNEL_0.value, BinaryMessageType.VISUALIZATION_BEAT.value],
+)
+@pytest.mark.asyncio
+async def test_writer_sends_prepacked_binary_unchanged(message_type: int) -> None:
+    """Binary queued without player_audio_header goes out byte for byte."""
+    clock = ManualClock(now_us_value=1_000_000)
+    conn, sent = await _start_recording_connection(
+        _DummyServer(loop=asyncio.get_running_loop(), clock=clock)
+    )
+    frame = pack_binary_header_raw(message_type, 1_500_000) + b"frame"
+
+    conn.send_binary(frame, role="artwork", timestamp_us=1_500_000, message_type=message_type)
+    await _drain_one(conn, sent)
+
+    assert sent == [frame]
+
+    await conn.disconnect(retry_connection=False)
+
+
+@pytest.mark.asyncio
+async def test_server_received_is_taken_before_decryption(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """server/time reports when client/time arrived, not when it was decrypted."""
+    clock = ManualClock(now_us_value=1_000_000)
+    server_session, client_session = make_paired_sessions()
+    raw = FakeWebSocket()
+    conn = SendspinConnection(
+        _DummyServer(loop=asyncio.get_running_loop(), clock=clock), wsock_client=MagicMock()
+    )
+    conn._transport = EncryptedWebSocket(raw, server_session)  # noqa: SLF001
+    decrypt = server_session.decrypt
+
+    def decrypt_slowly(data: bytes) -> bytes:
+        clock.advance_us(500)
+        return decrypt(data)
+
+    monkeypatch.setattr(server_session, "decrypt", decrypt_slowly)
+    client_time = ClientTimeMessage(payload=ClientTimePayload(client_transmitted=1))
+    await raw.push(
+        WSMessage(
+            WSMsgType.BINARY, client_session.encrypt(b"\x00" + client_time.to_json().encode()), ""
+        )
+    )
+    await raw.push(None)
+
+    with patch.object(conn, "send_priority_message") as send_priority:
+        await conn._run_message_loop()  # noqa: SLF001
+
+    assert send_priority.call_args.args[0].payload.server_received == 1_000_000
+
+
+@pytest.mark.asyncio
+async def test_pause_writer_stops_between_messages_not_fragments() -> None:
+    """Pausing the writer mid-way through a fragmented message lets the message finish."""
+    loop = asyncio.get_running_loop()
+    server = _DummyServer(loop=loop, clock=LoopClock(loop))
+    server_session, client_session = make_paired_sessions()
+
+    class _SlowWebSocket(FakeWebSocket):
+        async def send_bytes(self, data: bytes) -> None:
+            await super().send_bytes(data)
+            await asyncio.sleep(0)
+
+    raw = _SlowWebSocket()
+    conn = SendspinConnection(server, wsock_client=MagicMock())
+    conn._transport = EncryptedWebSocket(raw, server_session)  # noqa: SLF001
+    for name in ("x" * (2 * MAX_TRANSPORT_PLAINTEXT), "next"):
+        conn.send_message(
+            GroupUpdateServerMessage(payload=GroupUpdateServerPayload(group_name=name))
+        )
+    conn._writer_task = asyncio.create_task(conn._writer())  # noqa: SLF001
+    async with asyncio.timeout(1):
+        while not raw.sent:  # noqa: ASYNC110
+            await asyncio.sleep(0)
+
+    await conn._pause_writer()  # noqa: SLF001
+
+    frames = [client_session.decrypt(ct) for ct in raw.sent]  # type: ignore[arg-type]
+    assert all(frame[0] == MSG_TYPE_FRAGMENT for frame in frames)
+    assert len(frames) > 1
+    assert frames[-1][1] & FRAGMENT_FLAG_LAST
+    assert conn._writer_task is None  # noqa: SLF001
+
+    # The message queued behind it is kept for the resumed writer.
+    conn._resume_writer()  # noqa: SLF001
+    async with asyncio.timeout(1):
+        while len(raw.sent) == len(frames):  # noqa: ASYNC110
+            await asyncio.sleep(0)
+    assert b'"group_name":"next"' in client_session.decrypt(raw.sent[-1])  # type: ignore[arg-type]
+    await conn.disconnect(retry_connection=False)
+
+
+@pytest.mark.asyncio
+async def test_writer_wait_returns_once_a_stop_is_requested() -> None:
+    """A stop requested while the writer yielded is not lost when it next waits for work."""
+    loop = asyncio.get_running_loop()
+    server = _DummyServer(loop=loop, clock=LoopClock(loop))
+    conn = SendspinConnection(server, wsock_client=MagicMock())
+    conn._writer_stopping = True  # noqa: SLF001
+    conn._writer_wakeup.set()  # noqa: SLF001
+
+    async with asyncio.timeout(1):
+        await conn._wait_for_writer_work(0)  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_epoch_exempt_binary_survives_stream_end() -> None:
+    """A cancel queued before stream/end is sent ahead of it; the other queued binary drops."""
+    loop = asyncio.get_running_loop()
+    sent: list[str | bytes] = []
+
+    async def _record(payload: str | bytes) -> None:
+        sent.append(payload)
+
+    wsock = MagicMock()
+    wsock.closed = False
+    wsock.send_str = AsyncMock(side_effect=_record)
+    wsock.send_bytes = AsyncMock(side_effect=_record)
+    conn = SendspinConnection(
+        _DummyServer(loop=loop, clock=ManualClock(now_us_value=1_000_000)), wsock_client=wsock
+    )
+    conn._transport = wsock  # noqa: SLF001
+    await conn._setup_connection()  # noqa: SLF001
+    conn._streaming_roles.add("artwork")  # noqa: SLF001
+    message_type = BinaryMessageType.ARTWORK_CHANNEL_0.value
+
+    conn.send_binary(
+        next(pack_artwork_parts(0, b"part")),
+        role="artwork",
+        timestamp_us=0,
+        message_type=message_type,
+    )
+    conn.send_binary(
+        pack_artwork_cancel(0),
+        role="artwork",
+        timestamp_us=0,
+        message_type=message_type,
+        epoch_exempt=True,
+    )
+    conn.send_role_message("artwork", StreamEndMessage(payload=StreamEndPayload(roles=["artwork"])))
+    conn._writer_task = asyncio.create_task(conn._writer())  # noqa: SLF001
+    for _ in range(50):
+        if len(sent) >= 2:
+            break
+        await asyncio.sleep(0)
+
+    assert sent[0] == pack_artwork_cancel(0)
+    assert isinstance(sent[1], str)
+    assert json.loads(sent[1])["type"] == "stream/end"
+    assert len(sent) == 2
+
+    await conn.disconnect(retry_connection=False)
+
+
+@pytest.mark.asyncio
+async def test_wait_role_drained_returns_once_the_role_queue_is_empty() -> None:
+    """wait_role_drained() blocks while the role has queued messages."""
+    conn, sent = await _start_recording_connection(
+        _DummyServer(loop=asyncio.get_running_loop(), clock=ManualClock(now_us_value=1_000_000))
+    )
+    await asyncio.wait_for(conn.wait_role_drained("artwork"), 1)
+    message_type = BinaryMessageType.ARTWORK_CHANNEL_0.value
+    conn.send_binary(b"\x08\x00part", role="artwork", timestamp_us=0, message_type=message_type)
+
+    waiter = asyncio.create_task(conn.wait_role_drained("artwork"))
+    await asyncio.sleep(0)
+    assert not waiter.done()
+
+    await _drain_one(conn, sent)
+    await asyncio.wait_for(waiter, 1)
+    assert sent == [b"\x08\x00part"]
+
+    await conn.disconnect(retry_connection=False)
+
+
+@pytest.mark.asyncio
+async def test_paced_artwork_parts_interleave_with_queued_audio() -> None:
+    """Parts queued one at a time after the previous is sent alternate with ready audio."""
+    loop = asyncio.get_running_loop()
+    sent: list[bytes] = []
+
+    async def _slow_send(payload: bytes) -> None:
+        # A congested transport: every write yields to the event loop.
+        await asyncio.sleep(0)
+        sent.append(payload)
+
+    wsock = MagicMock()
+    wsock.closed = False
+    wsock.send_str = AsyncMock()
+    wsock.send_bytes = AsyncMock(side_effect=_slow_send)
+    conn = SendspinConnection(
+        _DummyServer(loop=loop, clock=ManualClock(now_us_value=1_000_000)), wsock_client=wsock
+    )
+    conn._transport = wsock  # noqa: SLF001
+    await conn._setup_connection()  # noqa: SLF001
+    for i in range(3):
+        _send_player_audio(conn, b"audio", 2_000_000 + i)
+    parts = pack_artwork_parts(0, bytes(3 * 65_517))
+
+    async def _transfer() -> None:
+        for part in parts:
+            await conn.wait_role_drained("artwork")
+            conn.send_binary(
+                part,
+                role="artwork",
+                timestamp_us=0,
+                message_type=BinaryMessageType.ARTWORK_CHANNEL_0.value,
+            )
+        await conn.wait_role_drained("artwork")
+
+    conn._writer_task = asyncio.create_task(conn._writer())  # noqa: SLF001
+    await asyncio.wait_for(_transfer(), 1)
+    for _ in range(50):
+        if len(sent) >= 6:
+            break
+        await asyncio.sleep(0)
+
+    kinds = [
+        "part" if frame[0] == BinaryMessageType.ARTWORK_CHANNEL_0.value else "audio"
+        for frame in sent
+    ]
+    assert kinds == ["part", "audio", "part", "audio", "part", "audio"]
+
+    await conn.disconnect(retry_connection=False)
+
+
+_STATE_NOW_US = 1_000_000
+
+
+def _state(**roles: SessionUpdateColor | SessionUpdateMetadata) -> ServerStateMessage:
+    return ServerStateMessage(ServerStatePayload(**roles))  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("existing", "incoming", "merges"),
+    [
+        (SessionUpdateColor(timestamp=_STATE_NOW_US), SessionUpdateColor(timestamp=2), True),
+        (
+            SessionUpdateColor(timestamp=_STATE_NOW_US + 1),
+            SessionUpdateColor(timestamp=_STATE_NOW_US + 2),
+            True,
+        ),
+        (
+            SessionUpdateColor(timestamp=_STATE_NOW_US + 1),
+            SessionUpdateColor(timestamp=_STATE_NOW_US),
+            True,
+        ),
+        (
+            SessionUpdateColor(timestamp=_STATE_NOW_US),
+            SessionUpdateColor(timestamp=_STATE_NOW_US + 1),
+            False,
+        ),
+    ],
+)
+def test_state_merge_keeps_current_state_ahead_of_scheduled(
+    existing: SessionUpdateColor, incoming: SessionUpdateColor, *, merges: bool
+) -> None:
+    """Queued state is merged unless a scheduled object would replace a current one.
+
+    The client must apply the current state first; spec messaging.md requires the first
+    server/state after activation to carry a past or present timestamp.
+    """
+    conn = SendspinConnection.__new__(SendspinConnection)
+    conn._server = MagicMock()  # noqa: SLF001
+    conn._server.clock = ManualClock(now_us_value=_STATE_NOW_US)  # noqa: SLF001
+
+    merged = conn._merge_state_messages(_state(color=existing), _state(color=incoming))  # noqa: SLF001
+
+    assert (merged == _state(color=incoming)) is merges
+    assert (merged is None) is not merges
+
+
+def test_state_merge_checks_each_scheduled_role_object() -> None:
+    """A scheduled metadata object over current metadata blocks the merge too."""
+    conn = SendspinConnection.__new__(SendspinConnection)
+    conn._server = MagicMock()  # noqa: SLF001
+    conn._server.clock = ManualClock(now_us_value=_STATE_NOW_US)  # noqa: SLF001
+
+    merged = conn._merge_state_messages(  # noqa: SLF001
+        _state(metadata=SessionUpdateMetadata(timestamp=1), color=SessionUpdateColor(timestamp=1)),
+        _state(metadata=SessionUpdateMetadata(timestamp=_STATE_NOW_US + 1)),
+    )
+
+    assert merged is None

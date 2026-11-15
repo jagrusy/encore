@@ -1,0 +1,354 @@
+# Things that fail silently
+
+Every entry here reports success and does the wrong thing. Read the section
+covering whatever you are about to touch.
+
+## Install and build
+
+- Nothing executes the scripts: gofmt, vet, the tests and shellcheck only
+  read them. CI asserts every tracked `.sh`, and each Python script in
+  `deploy/`, is `100755`.
+- `install.py` asks two questions separately: does `build.sh` **exist**, and is
+  it executable. Merged, a source tree with stripped mode bits
+  (`core.fileMode=false`, an unpacked archive) takes the tarball branch,
+  installs a stale `build/overdub`, and prints `binary verified`.
+- `cp` onto the running binary fails with ETXTBSY, but toolbox `cp` exits 0,
+  and `adb shell` exits 0 whatever happened remotely, so no exit status catches it.
+  The binary goes in by rename, and its md5 is read back.
+- Compare by hash, never by size. Go's VCS stamp (commit, timestamp, dirty flag)
+  is fixed-length, so different source gives the same size. `build.sh` pins
+  `-buildvcs=false`.
+- One tree gives one set of bytes, from any directory, with or without `.git`,
+  dirty or clean. `OVERDUB_VERSION` is empty unless the release job sets it.
+- A release binary and a local build of the same tag differ: the runner's NDK
+  is not yours. The published hash identifies the release.
+- The `-L` that `build.sh` hands cgo for its `libpthread` stubs must stay
+  relative. An absolute path enters cgo's action hash, so two directories give
+  two binaries. The `cd` at the top makes the relative path resolve.
+- `zip` records each entry's mtime in its headers. `deploy/mapdump/build.sh`
+  pins it to zip's 1980 floor and passes `-X`.
+- `TZ=UTC` must cover **both** the `touch` and the `zip`. A zip entry carries a
+  DOS stamp in local time, so a mismatch writes the offset into the headers.
+- A reproducible binary cannot say what it was built from. `git checkout`
+  carries modified files across a branch change, so the build is not the
+  branch, and every check downstream passes on the wrong binary.
+- The boot script is the only reason anything runs. `install.py` copies it to
+  Magisk 17.3's `/sbin/.core/img/.core/service.d/`. Where that directory does
+  not exist, the `cp` fails, the `rm` beside it still runs, and the Dot does
+  not start the daemon after its next reboot, with no log. The script's md5 is
+  read back.
+- The restart check tells a failed `adb` from an empty `ps`. Otherwise a pulled
+  cable reads as no pid, which is also what "nothing supervised the daemon"
+  prints.
+- `deploy/overdub.sh` is pushed with LF line ends whatever the checkout has. A
+  Windows checkout with `core.autocrlf` gives CRLF, and the Dot's shell would
+  then run the daemon as `-name kitchen\r`, which fails its name check.
+- `install.py` and `uninstall.py` hand `adb shell` one string, `su -c` and a
+  `shlex.quote`d command. Windows rebuilds the argument from a command line,
+  and a single string survives that unchanged. The two scripts ran this way on
+  macOS, Linux and Windows.
+
+## The cache partition
+
+- A Dot whose `cache` holds no filesystem roots fine and then cannot boot.
+  `fs_mgr_mount_all` fails in init's `on fs`, so `post-fs-data` and
+  `class_start main` never run: `zygote`, `netd` and `installd` have no
+  `init.svc.*` property at all, while every `class core` service is up. So the
+  Dot answers adb as root, `su` works, `/system` is mounted and read correctly
+  -- and `sys.boot_completed` never arrives. It reads like a bad `/system` or a
+  slow first boot. The reason is in dmesg, not logcat: `e2fsck: Bad magic
+  number in super-block`, then `fs_mgr: Failed to mount an un-encryptable or
+  wiped partition`, then `fs_mgr_mount_all returned unexpected error 255`.
+- In firebreak, `amonet-biscuit-v2.0.0` wipes cache and `stock` formats it.
+  `amonet-biscuit-v1.1.0` and `amonet-biscuit-v1.1.0-bboe` format userdata
+  only, so a cache damaged before a run survives it.
+- firebreak's
+  [docs/rooting.md](https://github.com/bboe/firebreak/blob/main/docs/rooting.md)
+  has what each run writes, `--write-test` included.
+
+## Paths and uids
+
+- `/system/bin/pm` has no shebang, so `execve` answers ENOEXEC. A shell runs it
+  anyway, so it works by hand over `adb shell`. `Installed()` would read the
+  failure as a missing package, so `pm` runs as `/system/bin/sh
+  /system/bin/pm`. `am` has a shebang and runs directly.
+- `/data/local/bin` must be `0700`, and `mkdir -p` keeps whatever mode an
+  earlier install left. `install.py` chmods it and reads the mode back.
+- MAP's uid, 32051, cannot traverse `0700`. `app_process` does not report a
+  permission error: it prints `ClassNotFoundException: MapDump` on
+  `DexPathList[[]]` and then `Aborted`, which reads like a bad jar. So the jar
+  lives in `/data/local/map`, owned by 32051, mode `0755`, and `install.py`
+  checks that uid 32051 can read it.
+- Uid 32051 cannot write to `/data/local/tmp` (`root:shell`). The failure is
+  `EACCES` from inside dalvik, well after start. Nothing the jar does at
+  runtime touches that directory.
+- `adb push` does not carry the local mode, and `/data/local/tmp` is `0771`, so
+  a `0600` key lands `0666` and any uid can reach it by name. `install.py`
+  stages secrets through a `0700` directory of its own, then removes it. The
+  binary and the boot script are not secret and use the shared directory.
+- There is no `/etc/resolv.conf`, so every Go lookup fails against `::1` with
+  "connection refused". `internal/alexa` reads `net.dns1` and `net.dns2` and
+  builds its own resolver.
+
+## logcat followers
+
+- `internal/alexa` follows logcat in a child process for each watcher. A
+  restart kills the daemon before its deferred `Kill` runs, so each child used
+  to be left running under init: two more `logcat` processes per restart, for
+  the rest of the boot.
+- Each child is started with `Pdeathsig: SIGKILL`, so the kernel kills it when
+  the daemon goes. A daemon killed with `kill` left no `logcat` behind.
+
+## The firewall
+
+- FireOS runs iptables with `INPUT policy DROP` and a port allowlist without
+  `tcp/6053`. Home Assistant then times out adding the device, with **nothing in
+  the daemon log**: the SYN never reaches userspace.
+  `internal/device/firewall.go` opens the port.
+- `iptables -L INPUT -n -v | grep 6053` shows a packet counter, which tells
+  "the device dropped it" from "the network did".
+- `AllowTCP` checks and then appends. The API's re-assert, network adb and the
+  Sendspin switch all call it, so two concurrent calls could both append, and
+  one `-D` would leave an ACCEPT behind. `chainMu` covers both mutations.
+- `DenyTCP` deletes until iptables reports no match, at most 16 times. An
+  iptables that answered 0 for a no-op delete would otherwise spin holding
+  `chainMu`, and `tcp/6053` would not be re-asserted.
+- `tcp/8928`'s rule goes in **after** the listener binds. A rule for a port
+  nothing listens on is re-asserted every 30 seconds for the rest of the boot.
+  The API needs no such order: a failed bind there exits the daemon.
+- `-w` here takes no seconds argument and waits on the xtables lock
+  indefinitely, and netd holds that lock constantly. So every call has a
+  10-second deadline, and a failed re-assert is logged once until it succeeds.
+
+## Startup races the network
+
+A warm restart hides all of this.
+
+| Uptime | What is true |
+|---|---|
+| 0-15 seconds | `wlan0` does not exist |
+| ~26 seconds | `sys.boot_completed`, boot script runs, daemon starts |
+| later | netd rebuilds the INPUT chain, discarding our rule |
+
+- Setup that depends on the network must wait or re-assert, never run once. On
+  a cold boot the daemon waited 15 seconds for `wlan0`, and its rule was gone
+  by 49 seconds and back by 64.
+- The 30-second re-assert leaves a gap. Across one reboot the rule went in at
+  25 seconds, was gone by 30, and was back at 57, and the mDNS announcement
+  went out at 36. So the rule is asserted once more immediately before
+  announcing; docs/sendspin.md has the order.
+- A repeated announcement with the same data is a refresh, not news, so the
+  responder cannot fix that for a peer that already holds the records. The
+  client's retry must. Home Assistant reconnects on a timer; Music Assistant
+  gives up permanently after about 8.5 minutes.
+
+## What a peer can spend
+
+- A peer causes every line the API logs. `%q` renders a frame of `\xff` at 4
+  times its size on 1 line: one `HelloRequest` wrote 131,207 bytes.
+- The boot script truncates the log only at boot and every 20th restart, and a
+  peer never makes the daemon exit.
+- `internal/untrustedlog` holds the limits: peer strings cut to 64 bytes before
+  quoting, every line cut at 512 bytes, 20 peer lines a minute, and 5,000 for
+  the run. `Cut` is the call site's job; peer bytes inside an error formatted
+  with `%v` are bounded only by the 512-byte line cut.
+- Counters are per `Log`, so each subsystem has its own budget and the disk
+  sees the sum.
+- A library can log past all of this. `mewkiz/flac` writes to the standard log
+  for 2 sample-rate codes, so a FLAC frame's codes are checked before it is
+  decoded. docs/sendspin.md has the rest.
+- The rate alone is not enough: 21 lines a minute at the measured 311-byte
+  worst case is 9 MB a day. After the 5,000th line one line says so, and then
+  nothing a peer does is logged until restart, not even a dropped count.
+- An empty pre-shared key is no key. `flynn/noise` reads an empty
+  `PresharedKey` as no psk modifier, so `NNpsk0` becomes `NN` and every peer
+  completes the handshake. The first handshake message is 48 bytes with a
+  32-byte key and 32 bytes with none. `noiseAccept` checks the key length;
+  `TestAServerWithNoKeyRefusesEveryone` fails without that check.
+- There is no peer allowlist: ESPHome has none. Any host that can route to the
+  Dot can hold one of the 8 slots until the handshake wait expires, and 8 such
+  hosts keep Home Assistant out. Past the slot, everything needs the key.
+- Two frames are indexed right after they are measured, and a peer with no key
+  reaches the first: an empty second handshake frame read at `[0]`, and a
+  decrypted message under 4 bytes sliced for its header. A panic there restarts
+  the daemon 5 seconds later with the button ungrabbed, so a repeated empty
+  frame is a restart loop. Each guard has a test that panics without it.
+
+## mDNS and adb
+
+- udp/5353 needs no rule: the stock INPUT chain accepts it, because Alexa runs
+  her own mDNS. Her sockets are why the responder sets `SO_REUSEADDR` and
+  `SO_REUSEPORT` before binding; without both the bind fails.
+- `adb` merges the device's stderr into its stdout, so any read-back can carry
+  a line of noise. A linker warning from `su` prepended to a key file makes it
+  decode to nothing. No deploy script compares the whole stream to a literal:
+  each matches the shape it expects, and a read that decides something ends
+  with a word of its own, so silence and "no" differ.
+
+## What adb will carry
+
+Binary from the host goes by `adb push`, binary from the Dot by
+`adb exec-out`, and `adb shell` carries only text whose shape is checked. A
+transfer added any other way breaks on Windows and says nothing.
+
+- A Windows adb reads its own stdin in text mode, where 0x1a ends the file, so
+  `adb shell` truncates a stream there. Every other byte survives.
+- Outbound, `adb shell` on Windows expands LF to CRLF.
+- `exec-in` is binary-safe, but it returns before the Dot has finished and
+  reports no status at all: `exec-in 'exit 7'` answers 0.
+- `install.py` pushes the binary, the boot script, the keys and the MapDump
+  jar. It reads back only text: md5s, modes, keys and a word of its own.
+- firebreak's
+  [docs/rooting.md](https://github.com/bboe/firebreak/blob/main/docs/rooting.md#what-adb-shell-carries)
+  has the measurements, and the one write that puts a stream on `adb shell`'s
+  stdin.
+
+## Tests and emulation
+
+- qemu-user's socket options depend on the build. Under `qemu-arm-static` on
+  x86-64 (CI), *setting* `IP_MULTICAST_IF` fails with `protocol not available`.
+  Under Docker's `linux/arm/v7` and `linux/arm64` it succeeds.
+  `IP_ADD_MEMBERSHIP`, one line earlier, succeeds everywhere.
+- Linux refuses `getsockopt(IP_MULTICAST_IF)` with `ENOPROTOOPT`, on native
+  arm64 too. So no test can assert the one option whose loss sends replies out
+  of the wrong interface. `SO_REUSEADDR`, `SO_REUSEPORT` and group membership
+  are read back and checked.
+- Tests that need a real multicast socket skip on `ENOPROTOOPT`, and each
+  read-back assertion skips on its own. The Dot runs ARM natively and never
+  meets this.
+
+## evdev and syscalls
+
+- `os.File.Fd()` calls `pfd.SetBlocking()`. After that, `Close()` cannot
+  interrupt a `Read` blocked on the file: the reader holds a goroutine, a
+  thread and the fd, and later acts on an event meant for the next owner.
+  Through `SyscallConn().Control`, the blocked read returns
+  `file already closed`.
+- So every ioctl on an evdev descriptor in `internal/evdev` goes through
+  `Control`. This is a package rule, because one call through `Fd()`
+  reintroduces the hang. `/dev/uinput` uses `Fd()` safely: nothing reads it.
+- A pointer converted to `uintptr` for a syscall must be converted in that
+  syscall's own argument list, in the same *frame*. Elsewhere the compiler
+  stops tracking it, and a stack move leaves the integer naming freed memory.
+  `ioctlPtr` takes an `unsafe.Pointer` and converts it in the call. `go vet`'s
+  `unsafeptr` check flags only the reverse conversion.
+
+## The device name
+
+- `-name` is required, has no default, and must be unique. The daemon checks it
+  as well as `install.py`, because the binary can be run by hand.
+- A fixed default would give every Dot the same name. Home Assistant prefixes
+  every entity id with it, so adding a second Dot stops in a conflict menu.
+- A MAC-derived default invents an identity ESPHome deliberately lacks: ESPHome
+  fails the compile without a `name:`.
+- `friendly_name` is sent equal to `name`. Without it Home Assistant logs an
+  INFO line on every connect, and the discovery card shows one string.
+- `name` is not derived from a display name. The identity is pinned at first
+  connect and the label is cosmetic, so a derived name turns a cosmetic edit
+  into a breaking change. Slugifying is also lossy: "Alexa's Dot" and "Alexas
+  Dot" both become `alexas-dot`.
+
+## The master mute
+
+- `volume_master_mute` in `AudioService` silences every stream and route, and
+  `dumpsys audio` still reads as working: `Mute count: 0`, levels and routes
+  unchanged.
+- `tinymix` shows the amp on, Alexa logs earcons finishing, and an `AudioTrack`
+  drains. `tinyplay` to a PCM device is audible: the flag sits above the amp.
+- It persists across power cycles, in
+  `/data/data/com.android.providers.settings/databases/settings.db`. FireOS
+  5.1's `settings` has no `list`; diff that database against a working Dot's.
+- Clear it with `IAudioService.setMasterMute` through `app_process`, not in the
+  database, and read `isMasterMute()` back.
+- `service call audio 3` sets it: 3 is `adjustMasterVolume`, next to
+  `adjustStreamVolume` at 2. docs/api.md has the mapping.
+
+## A stream mute another app holds
+
+- `setStreamMute` is counted per client. A mute another app holds keeps the
+  music silent after Home Assistant unmutes: the daemon's unmute takes away
+  only its own request. The volume keys do not lift it either.
+- The daemon mutes through `service call audio 8`, which passes no binder, so
+  that mute outlives the process that made it. A shell mute moved the count 1
+  to 2 and its unmute back to 1; more unmutes moved nothing.
+- The tell is `Mute count:` above 0 under `- STREAM_MUSIC:` in `dumpsys audio`
+  when Home Assistant did not mute the Dot. The volume sensors read 0%.
+- The holder seen is `com.amazon.mediaplayeragent`. Its
+  `ChannelVolumeController` carries out Alexa's `SetMute` directive, from the
+  cloud, the app or a voice command, and ignores the route. Capture its log
+  tag, `AMBS_ChannelVolumeController`, if it happens again.
+- It stuck once after a cable insert, and later came and went in 4 seconds with
+  nothing plugged in. 3 inserts, 1 during playback, and a speaker lost to range
+  all left every mute count at 0. The trigger is not known; the likeliest
+  reading, not measured, is a `SetMute(false)` that never arrived.
+- Its guard is not the cause. `setMute` skips a call that `isMute()` already
+  agrees with, and `isMute()` reads `getStreamVolume() == 0`. A muted stream
+  reads 0 there: through `IAudioService`, `getStreamVolume(3)` read 10, then 0
+  while muted, then 10.
+- A reboot clears it. Force-stopping `com.amazon.mediaplayeragent` should,
+  because a client's mutes go when its binder dies; that is not tested. Pulling
+  the cable cleared it once, by a path not traced.
+- "Alexa, mute" is another mechanism: it sets the level to 0 and leaves the
+  count at 0. `settings get global` reads `musicMuteHappened`,
+  `ttsMuteHappened` and `musicMuteByCloud`; all 3 read 0 on a Dot not muted.
+
+## Bluetooth and Wi-Fi share the radio
+
+- With a speaker connected, a weak Wi-Fi link collapses. At -75 dBm on 5 GHz,
+  a 54 Mbps link, TCP connects to the Dot took 126 ms at the median and 858 ms
+  at the 90th percentile, against 6 ms with the speaker off.
+- Sendspin chunks then arrived up to 7.9 seconds late, and whole 30-second
+  windows placed nothing, while a Dot in the same group got every chunk on
+  time.
+- Nothing names Wi-Fi. The log reads chunks due between -3.0 and -0.4 seconds
+  ahead, and the socket's receive queue sits at 0: the daemon reads what
+  arrives.
+- FireOS 5 does not roam. A Dot carried to another room stayed on its old
+  access point at -87 dBm with one at -55 dBm in the room. `svc wifi disable`
+  then `svc wifi enable` joined the near one in 14 seconds, and connects with
+  the speaker on then took 34 ms at the median.
+
+## A2DP with a zero SBC configuration
+
+- A speaker can pair, read `Device Connected`, follow the volume keys, show
+  `bluetooth` in `output_device`, and play nothing: SBC negotiated to zero.
+  `dumpsys audio` reads as working.
+- The tell is in logcat only: at connect, then several times a second.
+
+```
+W/bt-btif: btif_media_task get sbc rate = 0 kps
+E/bt-btif: ERROR btif_get_num_aa_frame Unsupported transcoding format 0x0
+```
+
+- Reconnecting does not clear it; a reboot does (`sbc rate = 328 kps`). Grep a
+  connect for `sbc rate` to tell this from a Dot that cannot do A2DP.
+
+## A speaker left paused
+
+- A speaker can connect at 328 kbps and play nothing, earcons included, while
+  AudioFlinger writes to the A2DP output at real time: about 17 writes of
+  2,560 frames a second. `dumpsys audio` reads as working.
+- The tell is AVRCP in `dumpsys bluetooth_manager`: `mCurrentPlayState` held
+  at `state=2`, paused. It follows A2DP: paused when the link drops during
+  playback, and `state=3`, playing, when a reconnect resumes. Stuck, it stayed
+  paused from 1 such drop through every later connect. `mLastStateUpdate` is
+  the uptime, in ms, of its last change.
+- Restarting the daemon does not clear it. Killing `com.android.bluetooth` as
+  root does: it restarts itself, and the speaker reconnects in about 20
+  seconds.
+- Seen once, with a JBL Go 3. The trigger is not known: the same drop during
+  playback, repeated, did not cause it.
+- Another silent connect fails before that. `audio_a2dp_hw` logs `Audiopath
+  start failed` every 15 seconds and no `sbc rate` line follows. Seen 2 times
+  in about 9 connects; turning the speaker off and on cleared it once. 1 such
+  line right after `Remote initiated A2DP Disconnect` is ordinary.
+- A good connect logs `sbc rate = 328 kps` about 0.75 seconds after
+  `A2dpStateMachine` logs `Enter Connected`.
+- `logcat -d` run later has lost these lines. The Bluetooth process logs
+  `GKI_LINUX` every 100 ms, so logd prunes its lines first. Start a live
+  capture before reproducing:
+
+```
+adb logcat -v time -s A2dpStateMachine:V bt-btif:V audio_a2dp_hw:V \
+  BluetoothA2dpServiceJni:V bt-l2cap:V > bt.log
+```

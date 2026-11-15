@@ -1,0 +1,321 @@
+package esphome
+
+import "github.com/bboe/overdub/internal/device"
+
+const (
+	entityCategoryNone       = 0
+	entityCategoryConfig     = 1
+	entityCategoryDiagnostic = 2
+
+	stateClassMeasurement     = 1
+	stateClassTotalIncreasing = 2
+
+	sensorAccuracyDecimals = 0
+
+	volumeIcon = "mdi:volume-high"
+
+	speakerIcon = "mdi:speaker"
+
+	micIcon = "mdi:microphone-off"
+
+	buttonModeIcon = "mdi:gesture-tap-button"
+
+	sendspinIcon = "mdi:speaker-multiple"
+
+	delayIcon = "mdi:timer-outline"
+
+	adbIcon = "mdi:console-network"
+
+	commandIcon = "mdi:microphone-message"
+
+	alexaIcon = "mdi:account-check"
+
+	bluetoothIcon = "mdi:bluetooth"
+)
+
+// UpdateCommand
+const (
+	updateCommandInstall = 1
+	updateCommandCheck   = 2
+)
+
+const (
+	numberModeBox = 1
+
+	delayStepMS = 1
+
+	delayUnit = "ms"
+)
+
+// ListEntitiesServicesArgument.ServiceArgType
+const serviceArgString = 3
+
+const commandMaxLength = 255
+
+var buttonModes = []string{"intercept", "monitor", "pass through"}
+
+type EventType string
+
+const (
+	EventPressEnd       EventType = "press_end"
+	EventMultiEnd       EventType = "multi_press_end"
+	EventLongPressStart EventType = "long_press_start"
+	EventLongPressEnd   EventType = "long_press_end"
+)
+
+var actionEvents = []EventType{
+	EventPressEnd, EventMultiEnd, EventLongPressStart, EventLongPressEnd,
+}
+
+const (
+	esphomeVersion = "2026.8.0"
+	manufacturer   = "Amazon"
+	unversioned    = "unversioned"
+)
+
+func projectName(model string) string {
+	return manufacturer + "." + model
+}
+
+func (s *Server) deviceInfo() []byte {
+	var msg pb
+	msg.boolean(1, false) // uses_password
+	msg.str(2, s.name)
+	msg.str(3, s.mac)
+	msg.str(4, esphomeVersion)
+	msg.str(6, s.model)
+	msg.str(8, projectName(s.model)) // project_name
+	msg.str(9, s.version)            // project_version
+	msg.str(12, manufacturer)
+	msg.str(13, s.name) // friendly_name
+	return msg.b
+}
+
+func (s *Server) listEntities(conn *conn) error {
+	for _, b := range s.buttons {
+		var action pb
+		action.str(1, b.objectID)
+		action.fixed32(2, b.keyEvent)
+		action.str(3, b.name)
+		action.boolean(6, false) // disabled_by_default
+		action.u32(7, entityCategoryNone)
+		action.str(8, "button") // device_class
+		for _, eventType := range actionEvents {
+			action.str(9, string(eventType))
+		}
+		if err := s.send(conn, msgListEvent, action.b); err != nil {
+			return err
+		}
+	}
+
+	var speaker pb
+	speaker.str(1, "speaker")
+	speaker.fixed32(2, s.keySpeaker)
+	speaker.str(3, "Speaker")
+	speaker.str(5, speakerIcon)
+	speaker.boolean(6, false) // disabled_by_default
+	speaker.u32(7, entityCategoryNone)
+	speaker.u32(11, s.mediaFeatures()) // feature_flags
+	if err := s.send(conn, msgListMediaPlayer, speaker.b); err != nil {
+		return err
+	}
+
+	for _, sensor := range []struct {
+		objectID    string
+		key         uint32
+		name        string
+		unit        string
+		deviceClass string
+		stateClass  uint32
+		icon        string
+	}{
+		{"uptime", s.keyUptime, "Uptime", "s", "duration", stateClassTotalIncreasing, ""},
+		{"wifi_signal", s.keyWifi, "WiFi signal", "dBm", "signal_strength", stateClassMeasurement, ""},
+		{"volume", s.keyVolume, "Volume", "%", "", stateClassMeasurement, volumeIcon},
+		{"cpu_temperature", s.keyCPU, "CPU temperature", "°C", "temperature", stateClassMeasurement, ""},
+		{"memory_available", s.keyMemory, "Memory available", "MiB", "data_size", stateClassMeasurement, ""},
+		{"jack_volume", s.keyJack, "Jack volume", "%", "", stateClassMeasurement, volumeIcon},
+		{"bluetooth_volume", s.keyBT, "Bluetooth volume", "%", "", stateClassMeasurement, volumeIcon},
+	} {
+		var entity pb
+		entity.str(1, sensor.objectID)
+		entity.fixed32(2, sensor.key)
+		entity.str(3, sensor.name)
+		entity.str(5, sensor.icon)
+		entity.str(6, sensor.unit)
+		entity.u32(7, sensorAccuracyDecimals)
+		entity.boolean(8, false)
+		entity.str(9, sensor.deviceClass)
+		entity.u32(10, sensor.stateClass)
+		entity.boolean(12, false)
+		entity.u32(13, entityCategoryDiagnostic)
+		if err := s.send(conn, msgListSensor, entity.b); err != nil {
+			return err
+		}
+	}
+
+	for _, sensor := range []struct {
+		objectID    string
+		key         uint32
+		name        string
+		deviceClass string
+		icon        string
+	}{
+		{"audio_jack", s.keyJackOn, "Audio jack", "plug", ""},
+		{"speaker_playing", s.keySound, "Speaker playing", "", speakerIcon},
+		{"alexa_registered", s.keyAlexa, "Alexa registered", "", alexaIcon},
+	} {
+		var entity pb
+		entity.str(1, sensor.objectID)
+		entity.fixed32(2, sensor.key)
+		entity.str(3, sensor.name)
+		entity.str(5, sensor.deviceClass)
+		entity.boolean(6, false)
+		entity.boolean(7, false)
+		entity.str(8, sensor.icon)
+		entity.u32(9, entityCategoryDiagnostic)
+		if err := s.send(conn, msgListBinarySensor, entity.b); err != nil {
+			return err
+		}
+	}
+
+	var mic pb
+	mic.str(1, "microphone_muted")
+	mic.fixed32(2, s.keyMicMute)
+	mic.str(3, "Microphone muted")
+	mic.str(5, micIcon)
+	mic.boolean(6, false)
+	mic.boolean(7, false)
+	if err := s.send(conn, msgListSwitch, mic.b); err != nil {
+		return err
+	}
+
+	if s.sendspinOn != nil {
+		var sw pb
+		sw.str(1, "sendspin")
+		sw.fixed32(2, s.keySendspin)
+		sw.str(3, "Sendspin")
+		sw.str(5, sendspinIcon)
+		sw.boolean(6, false)
+		sw.boolean(7, false)
+		sw.u32(8, entityCategoryConfig)
+		if err := s.send(conn, msgListSwitch, sw.b); err != nil {
+			return err
+		}
+	}
+
+	if s.delayMS != nil {
+		var delay pb
+		delay.str(1, "sendspin_output_delay")
+		delay.fixed32(2, s.keyDelay)
+		delay.str(3, "Sendspin output delay")
+		delay.str(5, delayIcon)
+		delay.float(6, 0)                     // min_value
+		delay.float(7, float32(s.delayMaxMS)) // max_value
+		delay.float(8, delayStepMS)           // step
+		delay.boolean(9, false)               // disabled_by_default
+		delay.u32(10, entityCategoryConfig)
+		delay.str(11, delayUnit) // unit_of_measurement
+		delay.u32(12, numberModeBox)
+		if err := s.send(conn, msgListNumber, delay.b); err != nil {
+			return err
+		}
+	}
+
+	for _, b := range s.buttons {
+		var mode pb
+		mode.str(1, b.objectID+"_mode")
+		mode.fixed32(2, b.keyMode)
+		mode.str(3, b.name+" mode")
+		mode.str(5, buttonModeIcon)
+		for _, option := range buttonModes {
+			mode.str(6, option)
+		}
+		mode.boolean(7, false) // disabled_by_default
+		mode.u32(8, entityCategoryConfig)
+		if err := s.send(conn, msgListSelect, mode.b); err != nil {
+			return err
+		}
+	}
+
+	var adb pb
+	adb.str(1, "network_adb")
+	adb.fixed32(2, s.keyADB)
+	adb.str(3, "Network ADB")
+	adb.str(5, adbIcon)
+	adb.str(6, device.ADBOff.String()) // options
+	adb.str(6, device.ADBInsecure.String())
+	if s.adbSecureOK() {
+		adb.str(6, device.ADBSecure.String())
+	}
+	adb.boolean(7, false) // disabled_by_default
+	adb.u32(8, entityCategoryConfig)
+	if err := s.send(conn, msgListSelect, adb.b); err != nil {
+		return err
+	}
+
+	var route pb
+	route.str(1, "output_device")
+	route.fixed32(2, s.keyOutput)
+	route.str(3, "Output device")
+	route.str(5, speakerIcon)
+	route.boolean(6, false) // disabled_by_default
+	route.u32(7, entityCategoryDiagnostic)
+	if err := s.send(conn, msgListTextSensor, route.b); err != nil {
+		return err
+	}
+
+	var connected pb
+	connected.str(1, "bluetooth_device")
+	connected.fixed32(2, s.keyBTDevice)
+	connected.str(3, "Bluetooth device")
+	connected.str(5, bluetoothIcon)
+	connected.boolean(6, false) // disabled_by_default
+	connected.u32(7, entityCategoryDiagnostic)
+	if err := s.send(conn, msgListTextSensor, connected.b); err != nil {
+		return err
+	}
+
+	if s.hasCommand() {
+		var command pb
+		command.str(1, "alexa_command")
+		command.fixed32(2, s.keyText)
+		command.str(3, "Alexa command")
+		command.str(5, commandIcon)
+		command.boolean(6, false) // disabled_by_default
+		command.u32(7, entityCategoryConfig)
+		command.u32(8, 0)                // min_length
+		command.u32(9, commandMaxLength) // max_length
+		command.u32(11, 0)               // mode: TEXT
+		if err := s.send(conn, msgListText, command.b); err != nil {
+			return err
+		}
+
+		var arg pb
+		arg.str(1, "text")
+		arg.u32(2, serviceArgString)
+
+		var service pb
+		service.str(1, "send_command")
+		service.fixed32(2, s.keyCommand)
+		service.sub(3, arg.b)
+		if err := s.send(conn, msgListService, service.b); err != nil {
+			return err
+		}
+	}
+
+	if s.updateCheck != nil {
+		var update pb
+		update.str(1, "firmware")
+		update.fixed32(2, s.keyUpdate)
+		update.str(3, "Firmware")
+		update.boolean(6, false) // disabled_by_default
+		update.u32(7, entityCategoryConfig)
+		update.str(8, "firmware") // device_class
+		if err := s.send(conn, msgListUpdate, update.b); err != nil {
+			return err
+		}
+	}
+
+	return s.send(conn, msgListEntitiesDone, nil)
+}

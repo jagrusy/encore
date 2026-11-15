@@ -1,0 +1,1088 @@
+"""Behavioural tests for SourceV1Role: decode path, lifecycle, and events."""
+
+from __future__ import annotations
+
+import base64
+import logging
+from typing import Any
+
+import pytest
+
+from aiosendspin.audio.codecs import PcmPassthrough
+from aiosendspin.audio.format import AudioFormat
+from aiosendspin.clock import ManualClock
+from aiosendspin.models.core import ClientStatePayload
+from aiosendspin.models.source import (
+    ClientHelloSourceFeatures,
+    ClientHelloSourceSupport,
+    ClientStreamStartPayload,
+    ClientStreamStartSource,
+    SourceStatePayload,
+)
+from aiosendspin.models.types import AudioCodec, BinaryMessageType, SignalState
+from aiosendspin.server.roles.source import (
+    SourceSignalChangedEvent,
+    SourceStreamEndedEvent,
+    SourceStreamStartedEvent,
+)
+from aiosendspin.server.roles.source.stream import SourceStream
+from aiosendspin.server.roles.source.v1 import SourceV1Role
+from tests.conftest import flac_frame, sine_pcm_16bit
+
+
+class _FakeInfo:
+    def __init__(self, *, line_sense: bool) -> None:
+        self.source_support = ClientHelloSourceSupport(
+            features=ClientHelloSourceFeatures(line_sense=line_sense)
+        )
+
+
+class _FakeConnection:
+    pass
+
+
+class _FakeServer:
+    def __init__(self) -> None:
+        self.clock = ManualClock(now_us_value=5_000_000)
+
+
+class _FakeClient:
+    def __init__(self, *, line_sense: bool = True) -> None:
+        self.events: list[Any] = []
+        self._info = _FakeInfo(line_sense=line_sense)
+        self.connection = _FakeConnection()
+        self.sent: list[Any] = []
+        self.available = True
+        self.noncompliance: list[str] = []
+        self.held = False
+        self._server = _FakeServer()
+
+    @property
+    def info(self) -> _FakeInfo:
+        return self._info
+
+    def flag_noncompliance(self, reason: str) -> None:
+        self.noncompliance.append(reason)
+
+    def awaits_role_state(self, _role_family: str) -> bool:
+        return self.held
+
+    def _signal_event(self, event: Any) -> None:
+        self.events.append(event)
+
+    def send_role_message(self, _family: str, message: Any) -> None:
+        self.sent.append(message)
+
+
+def _pcm_start_payload() -> ClientStreamStartPayload:
+    return ClientStreamStartPayload(
+        source=ClientStreamStartSource(
+            codec=AudioCodec.PCM, channels=2, sample_rate=48000, bit_depth=16, codec_header=None
+        )
+    )
+
+
+_SOURCE_STATE = ClientStatePayload(available=True, source=SourceStatePayload())
+
+
+def _connected_role(client: _FakeClient | None = None) -> tuple[SourceV1Role, _FakeClient]:
+    """Build a connected role whose client has reported its source state."""
+    client = client or _FakeClient()
+    role = SourceV1Role(client=client)  # type: ignore[arg-type]
+    role.on_connect()
+    role.on_initial_client_state(_SOURCE_STATE)
+    role.on_client_state(_SOURCE_STATE)
+    return role, client
+
+
+def _make_role() -> tuple[SourceV1Role, _FakeClient]:
+    """Build a connected role the server has already asked to stream."""
+    role, client = _connected_role()
+    role.request_start()
+    return role, client
+
+
+def test_client_stream_start_emits_event_with_native_format() -> None:
+    """on_client_stream_start announces the decoded handle and its PCM format."""
+    role, client = _make_role()
+    role.on_client_stream_start(_pcm_start_payload())
+    started = [e for e in client.events if isinstance(e, SourceStreamStartedEvent)]
+    assert len(started) == 1
+    assert started[0].audio_format.sample_rate == 48000
+    assert started[0].audio_format.channels == 2
+
+
+async def test_pcm_loopback_is_bit_exact_through_role() -> None:
+    """PCM streamed up as type-12 chunks decodes bit-exact out of the handle."""
+    role, client = _make_role()
+    role.on_client_stream_start(_pcm_start_payload())
+    handle = next(e for e in client.events if isinstance(e, SourceStreamStartedEvent)).handle
+
+    pcm = sine_pcm_16bit(48000)
+    encoder = PcmPassthrough(sample_rate=48000, bit_depth=16, channels=2)
+    ts = 1_000_000
+    for frame, dur in encoder.process(pcm, ts, 0):
+        role.on_binary_chunk(BinaryMessageType.SOURCE_AUDIO_CHUNK.value, ts, frame)
+        ts += dur
+    role.on_client_stream_end()
+
+    received = bytearray()
+    async for chunk, _chunk_ts in handle:
+        received += chunk
+    assert bytes(received) == pcm
+
+
+def test_role_declares_only_the_source_binary_type() -> None:
+    """The source role consumes only the source audio binary type."""
+    role, _client = _make_role()
+    assert role.handles_inbound_binary(BinaryMessageType.SOURCE_AUDIO_CHUNK.value)
+    assert not role.handles_inbound_binary(BinaryMessageType.AUDIO_CHUNK.value)
+
+
+def test_binary_chunk_dropped_when_inactive() -> None:
+    """A chunk with no active stream is dropped without starting one or erroring."""
+    role, client = _make_role()
+    role.on_binary_chunk(BinaryMessageType.SOURCE_AUDIO_CHUNK.value, 0, b"\x00\x00\x00\x00")
+    assert not any(isinstance(e, SourceStreamStartedEvent) for e in client.events)
+
+
+@pytest.mark.parametrize(
+    "bad_format",
+    [
+        {"bit_depth": 17},
+        {"channels": 0},
+        {"sample_rate": 0},
+    ],
+)
+def test_impossible_declared_format_opens_no_stream(bad_format: dict[str, int]) -> None:
+    """An unusable declared format is flagged at start, not failed inside the consumer."""
+    role, client = _make_role()
+    fields = {"codec": AudioCodec.PCM, "channels": 2, "sample_rate": 48000, "bit_depth": 16}
+    fields.update(bad_format)
+    role.on_client_stream_start(
+        ClientStreamStartPayload(source=ClientStreamStartSource(**fields))  # type: ignore[arg-type]
+    )
+    assert not role.stream_active
+    assert [e for e in client.events if isinstance(e, SourceStreamStartedEvent)] == []
+    assert len(client.noncompliance) == 1
+
+
+@pytest.mark.parametrize("codec", [AudioCodec.PCM, AudioCodec.OPUS])
+def test_codec_header_for_headerless_codec_is_flagged_and_dropped(
+    monkeypatch: pytest.MonkeyPatch, codec: AudioCodec
+) -> None:
+    """A codec_header the codec does not take is flagged and never reaches the decoder."""
+    headers: list[bytes | None] = []
+
+    def _decoder(*_args: object, codec_header: bytes | None, **_kwargs: object) -> object:
+        headers.append(codec_header)
+        return object()
+
+    monkeypatch.setattr("aiosendspin.server.roles.source.v1.opus_available", lambda: True)
+    monkeypatch.setattr("aiosendspin.server.roles.source.v1.create_decoder", _decoder)
+    role, client = _make_role()
+    role.on_client_stream_start(
+        ClientStreamStartPayload(
+            source=ClientStreamStartSource(
+                codec=codec,
+                channels=2,
+                sample_rate=48000,
+                bit_depth=16,
+                codec_header=base64.b64encode(b"head").decode(),
+            )
+        )
+    )
+
+    assert role.stream_active
+    assert headers == [None]
+    assert client.noncompliance == [f"client-stream/start sent a codec_header for {codec.value}"]
+
+
+async def test_pcm_chunk_with_a_partial_frame_is_flagged_and_passed_on() -> None:
+    """A pcm chunk cut mid-frame is flagged, yet still reaches the stream."""
+    role, client = _make_role()
+    role.on_client_stream_start(_pcm_start_payload())
+    handle = next(e for e in client.events if isinstance(e, SourceStreamStartedEvent)).handle
+
+    role.on_binary_chunk(BinaryMessageType.SOURCE_AUDIO_CHUNK.value, 0, bytes(3))
+    role.on_client_stream_end()
+
+    assert client.noncompliance == [
+        "sent a pcm source audio chunk that is not a whole number of frames"
+    ]
+    assert [chunk async for chunk, _ in handle] == [bytes(3)]
+
+
+def test_pcm_chunk_longer_than_150_ms_is_flagged() -> None:
+    """Exactly 150 ms of pcm frames is allowed, one frame more is flagged."""
+    role, client = _make_role()
+    role.on_client_stream_start(_pcm_start_payload())
+
+    role.on_binary_chunk(BinaryMessageType.SOURCE_AUDIO_CHUNK.value, 0, bytes(7200 * 4))
+    assert client.noncompliance == []
+    role.on_binary_chunk(BinaryMessageType.SOURCE_AUDIO_CHUNK.value, 0, bytes(7201 * 4))
+    assert client.noncompliance == ["sent a source audio chunk longer than 150 ms"]
+
+
+def test_opus_start_ignores_declared_bit_depth() -> None:
+    """An opus stream opens at 16-bit no matter what bit_depth the client declared."""
+    role, client = _make_role()
+    role.on_client_stream_start(
+        ClientStreamStartPayload(
+            source=ClientStreamStartSource(
+                codec=AudioCodec.OPUS, channels=2, sample_rate=48000, bit_depth=17
+            )
+        )
+    )
+    handle = next(e for e in client.events if isinstance(e, SourceStreamStartedEvent)).handle
+    assert handle.audio_format.bit_depth == 16
+
+
+def test_stream_buffer_drops_oldest_beyond_byte_budget() -> None:
+    """A stalled consumer's buffer is bounded by bytes, not just chunk count."""
+    stream = SourceStream(AudioFormat(sample_rate=100, bit_depth=16, channels=1))
+    for i in range(3):
+        stream._push(bytes([i]) * 1500, i)  # noqa: SLF001
+
+    assert [ts for _, ts in stream._queue] == [2]  # noqa: SLF001
+    assert stream._buffered_bytes == 1500  # noqa: SLF001
+
+
+def test_flac_start_requires_streaminfo_header() -> None:
+    """A FLAC stream cannot open without its required STREAMINFO header."""
+    role, client = _make_role()
+    role.on_client_stream_start(
+        ClientStreamStartPayload(
+            source=ClientStreamStartSource(
+                codec=AudioCodec.FLAC,
+                channels=2,
+                sample_rate=48000,
+                bit_depth=16,
+            )
+        )
+    )
+
+    assert not role.stream_active
+    assert client.noncompliance == ["client-stream/start FLAC codec_header must contain STREAMINFO"]
+
+
+async def test_stream_replacement_announces_the_end_of_the_old_handle() -> None:
+    """Replacing a stream tells listeners the previous handle is finished."""
+    role, client = _make_role()
+    role.on_client_stream_start(_pcm_start_payload())
+    role.on_client_stream_start(_pcm_start_payload())
+    assert len([e for e in client.events if isinstance(e, SourceStreamEndedEvent)]) == 1
+
+
+def test_teardown_announces_stream_end() -> None:
+    """Disconnect ends the stream visibly rather than dropping the handle silently."""
+    role, client = _make_role()
+    role.on_client_stream_start(_pcm_start_payload())
+    role.on_disconnect()
+    assert len([e for e in client.events if isinstance(e, SourceStreamEndedEvent)]) == 1
+
+
+def test_source_requires_initial_state() -> None:
+    """The source role participates in the initial state gate."""
+    role, _client = _make_role()
+    assert role.requires_initial_state() is True
+
+
+def test_stream_start_after_stop_is_discarded_quietly() -> None:
+    """A start answering a start that crossed a stop opens no handle and ends without events."""
+    role, client = _make_role()
+    role.request_stop()
+    role.on_client_stream_start(_pcm_start_payload())
+    role.on_binary_chunk(BinaryMessageType.SOURCE_AUDIO_CHUNK.value, 0, b"\x00\x00\x00\x00")
+    role.on_client_stream_end()
+
+    assert not role.stream_active
+    assert client.events == []
+    assert client.noncompliance == []
+
+
+def test_invalid_stream_start_after_stop_is_flagged() -> None:
+    """A start crossing a stop is still checked against the spec before it is discarded."""
+    role, client = _make_role()
+    role.request_stop()
+    role.on_client_stream_start(
+        ClientStreamStartPayload(
+            source=ClientStreamStartSource(
+                codec=AudioCodec.PCM, channels=2, sample_rate=48000, bit_depth=40
+            )
+        )
+    )
+
+    assert len(client.noncompliance) == 1
+
+
+def test_stream_start_after_restart_opens_a_stream() -> None:
+    """A start requested again after a stop wants the stream, whichever start it answers."""
+    role, client = _make_role()
+    role.request_stop()
+    role.request_start()
+    role.on_client_stream_start(_pcm_start_payload())
+
+    assert role.stream_active
+    assert len([e for e in client.events if isinstance(e, SourceStreamStartedEvent)]) == 1
+
+
+def test_decoder_build_failure_discards_the_stream(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A stream whose decoder cannot be built drops its chunks without flagging the client."""
+
+    def _fail(*_args: object, **_kwargs: object) -> None:
+        raise ValueError("no decoder")
+
+    monkeypatch.setattr("aiosendspin.server.roles.source.v1.create_decoder", _fail)
+    role, client = _make_role()
+    role.on_client_stream_start(_pcm_start_payload())
+    role.on_binary_chunk(BinaryMessageType.SOURCE_AUDIO_CHUNK.value, 0, b"\x00\x00\x00\x00")
+    role.on_client_stream_end()
+
+    assert not role.stream_active
+    assert client.events == []
+    assert client.noncompliance == []
+
+
+class _FailingDecoder:
+    def decode(self, _data: bytes) -> bytes:
+        raise ValueError("bad frame")
+
+    def flush(self) -> bytes:
+        return b""
+
+
+def test_repeated_decode_failures_are_throttled(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A decoder failing on every chunk logs one traceback, then a periodic count."""
+    now_s = [5.0]
+    monkeypatch.setattr(
+        "aiosendspin.server.roles.source.v1.create_decoder", lambda *_a, **_k: _FailingDecoder()
+    )
+    monkeypatch.setattr("aiosendspin.server.roles.source.v1.time.monotonic", lambda: now_s[0])
+    role, _client = _make_role()
+    role.on_client_stream_start(_pcm_start_payload())
+
+    with caplog.at_level(logging.WARNING):
+        for _ in range(5):
+            role.on_binary_chunk(BinaryMessageType.SOURCE_AUDIO_CHUNK.value, 0, b"\x00")
+        now_s[0] += 30.0
+        role.on_binary_chunk(BinaryMessageType.SOURCE_AUDIO_CHUNK.value, 0, b"\x00")
+
+    assert [(r.levelno, r.args[0], bool(r.exc_info)) for r in caplog.records] == [
+        (logging.WARNING, 1, True),
+        (logging.WARNING, 5, False),
+    ]
+
+
+def test_next_stream_reports_its_first_decode_failure(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A new stream's first decode failure logs its traceback, even right after the last report."""
+    monkeypatch.setattr(
+        "aiosendspin.server.roles.source.v1.create_decoder", lambda *_a, **_k: _FailingDecoder()
+    )
+    role, _client = _make_role()
+    role.on_client_stream_start(_pcm_start_payload())
+    for _ in range(2):
+        role.on_binary_chunk(BinaryMessageType.SOURCE_AUDIO_CHUNK.value, 0, b"\x00")
+    role.on_client_stream_end()
+    role.on_client_stream_start(_pcm_start_payload())
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        role.on_binary_chunk(BinaryMessageType.SOURCE_AUDIO_CHUNK.value, 0, b"\x00")
+
+    assert [(r.args[0], bool(r.exc_info)) for r in caplog.records] == [(1, True)]
+
+
+def test_chunk_that_fails_to_decode_is_flagged(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A chunk the decoder rejects, such as a FLAC frame split across chunks, is flagged."""
+    monkeypatch.setattr(
+        "aiosendspin.server.roles.source.v1.create_decoder", lambda *_a, **_k: _FailingDecoder()
+    )
+    role, client = _make_role()
+    role.on_client_stream_start(_start_payload(AudioCodec.FLAC))
+
+    role.on_binary_chunk(BinaryMessageType.SOURCE_AUDIO_CHUNK.value, 0, b"\x00")
+
+    assert client.noncompliance == ["sent a source audio chunk that failed to decode"]
+
+
+class _PassthroughDecoder:
+    def decode(self, data: bytes) -> bytes:
+        return data
+
+    def flush(self) -> bytes:
+        return b""
+
+
+def test_flac_chunk_longer_than_150_ms_is_flagged(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A FLAC chunk decoding to exactly 150 ms is allowed, one frame more is flagged."""
+    monkeypatch.setattr(
+        "aiosendspin.server.roles.source.v1.create_decoder",
+        lambda *_a, **_k: _PassthroughDecoder(),
+    )
+    role, client = _make_role()
+    role.on_client_stream_start(_start_payload(AudioCodec.FLAC, bit_depth=24))
+
+    role.on_binary_chunk(BinaryMessageType.SOURCE_AUDIO_CHUNK.value, 0, bytes(7200 * 6))
+    assert client.noncompliance == []
+    role.on_binary_chunk(BinaryMessageType.SOURCE_AUDIO_CHUNK.value, 0, bytes(7201 * 6))
+    assert client.noncompliance == ["sent a source audio chunk longer than 150 ms"]
+
+
+@pytest.mark.parametrize(
+    ("within", "beyond"),
+    [
+        # 150 ms at 48 kHz plus one 4096-sample block is 11296 samples.
+        (
+            b"".join(flac_frame(64, number=n) for n in range(176)),
+            b"".join(flac_frame(64, number=n) for n in range(177)),
+        ),
+        (bytes(90_368), bytes(90_369)),
+    ],
+    ids=["frame samples", "bytes"],
+)
+def test_flac_chunk_beyond_its_budget_is_dropped_before_decoding(
+    monkeypatch: pytest.MonkeyPatch, within: bytes, beyond: bytes
+) -> None:
+    """Too many frame samples, or more bytes than 150 ms can need, never reach the decoder."""
+    decoded: list[bytes] = []
+
+    class _RecordingDecoder(_PassthroughDecoder):
+        def decode(self, data: bytes) -> bytes:
+            decoded.append(data)
+            return b""
+
+    monkeypatch.setattr(
+        "aiosendspin.server.roles.source.v1.create_decoder", lambda *_a, **_k: _RecordingDecoder()
+    )
+    role, client = _make_role()
+    role.on_client_stream_start(_start_payload(AudioCodec.FLAC))
+
+    role.on_binary_chunk(BinaryMessageType.SOURCE_AUDIO_CHUNK.value, 0, within)
+    role.on_binary_chunk(BinaryMessageType.SOURCE_AUDIO_CHUNK.value, 0, beyond)
+
+    assert decoded == [within]
+    assert client.noncompliance == ["sent a source audio chunk longer than 150 ms"]
+
+
+@pytest.mark.parametrize(
+    "frames",
+    [
+        [flac_frame(1024, rate_code=9)],
+        [flac_frame(1024), flac_frame(1024, number=1, channels=1)],
+    ],
+    ids=["first frame at 44.1 kHz", "later frame in mono"],
+)
+async def test_flac_frame_in_another_format_is_dropped(frames: list[bytes]) -> None:
+    """A frame whose rate or channel count differs from the announced format is flagged."""
+    pytest.importorskip("av")
+    role, client = _make_role()
+    role.on_client_stream_start(_start_payload(AudioCodec.FLAC))
+    handle = next(e for e in client.events if isinstance(e, SourceStreamStartedEvent)).handle
+
+    for frame in frames:
+        role.on_binary_chunk(BinaryMessageType.SOURCE_AUDIO_CHUNK.value, 0, frame)
+    role.on_client_stream_end()
+
+    assert client.noncompliance == ["sent a source audio chunk that failed to decode"]
+    assert [len(chunk) async for chunk, _ in handle] == [1024 * 4] * (len(frames) - 1)
+
+
+def test_empty_flac_chunk_is_flagged_and_not_decoded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An empty FLAC chunk never reaches the decoder, where it would end decoding."""
+    decoded: list[bytes] = []
+
+    class _RecordingDecoder(_PassthroughDecoder):
+        def decode(self, data: bytes) -> bytes:
+            decoded.append(data)
+            return data
+
+    monkeypatch.setattr(
+        "aiosendspin.server.roles.source.v1.create_decoder", lambda *_a, **_k: _RecordingDecoder()
+    )
+    role, client = _make_role()
+    role.on_client_stream_start(_start_payload(AudioCodec.FLAC))
+
+    role.on_binary_chunk(BinaryMessageType.SOURCE_AUDIO_CHUNK.value, 0, b"")
+    role.on_binary_chunk(BinaryMessageType.SOURCE_AUDIO_CHUNK.value, 0, bytes(4))
+
+    assert client.noncompliance == ["sent an empty flac or opus source audio chunk"]
+    assert decoded == [bytes(4)]
+
+
+def test_empty_pcm_chunk_is_accepted() -> None:
+    """An empty pcm chunk is zero whole frames, so it is not flagged."""
+    role, client = _make_role()
+    role.on_client_stream_start(_pcm_start_payload())
+
+    role.on_binary_chunk(BinaryMessageType.SOURCE_AUDIO_CHUNK.value, 0, b"")
+
+    assert client.noncompliance == []
+
+
+def test_start_request_does_not_survive_disconnect() -> None:
+    """Streaming state is per-connection, so a reconnect needs a fresh start."""
+    role, client = _make_role()
+    role.on_disconnect()
+    role.on_connect()
+    role.on_client_stream_start(_pcm_start_payload())
+    assert not role.stream_active
+    assert [e for e in client.events if isinstance(e, SourceStreamStartedEvent)] == []
+
+
+def test_becoming_unavailable_implicitly_stops_stream() -> None:
+    """Becoming unavailable closes the handle, and a later start opens no new one."""
+    role, client = _make_role()
+    role.on_client_stream_start(_pcm_start_payload())
+
+    role.on_availability_changed(old_available=True, new_available=False)
+    role.on_client_stream_start(_pcm_start_payload())
+
+    assert not role.stream_active
+    assert len([e for e in client.events if isinstance(e, SourceStreamStartedEvent)]) == 1
+    assert len([e for e in client.events if isinstance(e, SourceStreamEndedEvent)]) == 1
+
+
+async def test_second_start_restarts_stream() -> None:
+    """A second client-stream/start ends the prior handle and announces a new one."""
+    role, client = _make_role()
+    role.on_client_stream_start(_pcm_start_payload())
+    first = next(e for e in client.events if isinstance(e, SourceStreamStartedEvent)).handle
+    role.on_client_stream_start(_pcm_start_payload())
+    # The first handle must terminate so its consumer is released.
+    drained = [chunk async for chunk, _ in first]
+    assert drained == []
+    starts = [e for e in client.events if isinstance(e, SourceStreamStartedEvent)]
+    assert len(starts) == 2
+    assert starts[1].handle is not first
+
+
+async def test_client_stream_end_emits_event_and_closes_handle() -> None:
+    """client-stream/end surfaces SourceStreamEndedEvent AND terminates the handle."""
+    role, client = _make_role()
+    role.on_client_stream_start(_pcm_start_payload())
+    handle = next(e for e in client.events if isinstance(e, SourceStreamStartedEvent)).handle
+    role.on_client_stream_end()
+    assert any(isinstance(e, SourceStreamEndedEvent) for e in client.events)
+    # The handle must be exhausted so a consumer's `async for` exits rather than hangs.
+    drained = [chunk async for chunk, _ in handle]
+    assert drained == []
+
+
+@pytest.mark.parametrize("teardown", ["on_deactivate", "on_disconnect"])
+async def test_teardown_ends_active_stream(teardown: str) -> None:
+    """Role teardown (deactivation or disconnect) releases a waiting stream consumer."""
+    role, client = _make_role()
+    role.on_client_stream_start(_pcm_start_payload())
+    handle = next(e for e in client.events if isinstance(e, SourceStreamStartedEvent)).handle
+    getattr(role, teardown)()
+    drained = [chunk async for chunk, _ in handle]
+    assert drained == []
+    # State is reset, so a later chunk is a safe no-op rather than pushed to the dead handle.
+    role.on_binary_chunk(BinaryMessageType.SOURCE_AUDIO_CHUNK.value, 0, b"\x00\x00\x00\x00")
+
+
+def test_client_state_surfaces_signal_only_when_advertised() -> None:
+    """Signal is surfaced only when the source advertised the line_sense feature."""
+    advertised = _FakeClient(line_sense=True)
+    role = SourceV1Role(client=advertised)  # type: ignore[arg-type]
+    role.on_connect()
+    role.on_client_state(ClientStatePayload(source=SourceStatePayload(signal=SignalState.PRESENT)))
+    event = next(e for e in advertised.events if isinstance(e, SourceSignalChangedEvent))
+    assert event.signal is SignalState.PRESENT
+
+    state = ClientStatePayload(source=SourceStatePayload(signal=SignalState.PRESENT))
+    assert role.client_state_deviations(state) == []
+
+    unadvertised = _FakeClient(line_sense=False)
+    role = SourceV1Role(client=unadvertised)  # type: ignore[arg-type]
+    role.on_connect()
+    assert role.client_state_deviations(state) == ["source signal sent without line_sense support"]
+    role.on_client_state(state)
+    assert not any(isinstance(e, SourceSignalChangedEvent) for e in unadvertised.events)
+
+
+def test_request_start_and_stop_send_server_command() -> None:
+    """request_start/request_stop emit server/command with the right verb."""
+    role, client = _connected_role()
+    role.request_start()
+    role.request_stop()
+    commands = [m.payload.source.command for m in client.sent]
+    assert commands == ["start", "stop"]
+
+
+def test_client_state_signal_event_only_fires_on_change() -> None:
+    """Clients repeat the signal in every state, so only transitions are surfaced."""
+    client = _FakeClient(line_sense=True)
+    role = SourceV1Role(client=client)  # type: ignore[arg-type]
+    role.on_connect()
+
+    for _ in range(3):
+        role.on_client_state(
+            ClientStatePayload(source=SourceStatePayload(signal=SignalState.PRESENT))
+        )
+    role.on_client_state(ClientStatePayload(source=SourceStatePayload(signal=SignalState.ABSENT)))
+    role.on_client_state(ClientStatePayload(source=SourceStatePayload(signal=SignalState.ABSENT)))
+
+    signals = [e.signal for e in client.events if isinstance(e, SourceSignalChangedEvent)]
+    assert signals == [SignalState.PRESENT, SignalState.ABSENT]
+
+
+def test_reconnect_resurfaces_the_current_signal() -> None:
+    """A disconnect forgets the signal, so the client's next report is surfaced again."""
+    client = _FakeClient(line_sense=True)
+    role = SourceV1Role(client=client)  # type: ignore[arg-type]
+    role.on_connect()
+    role.on_client_state(ClientStatePayload(source=SourceStatePayload(signal=SignalState.PRESENT)))
+    role.on_disconnect()
+    role.on_client_state(ClientStatePayload(source=SourceStatePayload(signal=SignalState.PRESENT)))
+
+    signals = [e.signal for e in client.events if isinstance(e, SourceSignalChangedEvent)]
+    assert signals == [SignalState.PRESENT, SignalState.PRESENT]
+
+
+def test_accepted_codecs_track_opus_availability(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Opus joins the mandatory codecs only when PyAV can handle it."""
+    monkeypatch.setattr("aiosendspin.server.roles.source.v1.opus_available", lambda: False)
+    assert SourceV1Role.accepted_codecs() == [AudioCodec.FLAC, AudioCodec.PCM]
+
+    monkeypatch.setattr("aiosendspin.server.roles.source.v1.opus_available", lambda: True)
+    assert AudioCodec.OPUS in SourceV1Role.accepted_codecs()
+
+
+def test_unlisted_codec_is_flagged_and_opens_no_stream(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A codec server/hello did not list is rejected as non-compliant."""
+    monkeypatch.setattr("aiosendspin.server.roles.source.v1.opus_available", lambda: False)
+    role, client = _make_role()
+
+    role.on_client_stream_start(
+        ClientStreamStartPayload(
+            source=ClientStreamStartSource(
+                codec=AudioCodec.OPUS, channels=2, sample_rate=48000, bit_depth=16
+            )
+        )
+    )
+
+    assert any("server/hello did not list" in reason for reason in client.noncompliance)
+    assert not role.stream_active
+    assert [e for e in client.events if isinstance(e, SourceStreamStartedEvent)] == []
+
+
+def test_state_without_source_object_is_flagged() -> None:
+    """A client/state required by the activation must carry the source object."""
+    role = SourceV1Role(client=_FakeClient())  # type: ignore[arg-type]
+
+    assert role.initial_state_deviations(ClientStatePayload(available=True)) == [
+        "has an active source role but no source state"
+    ]
+    assert role.initial_state_deviations(_SOURCE_STATE) == []
+
+
+def _commands(client: _FakeClient) -> list[str]:
+    return [m.payload.source.command for m in client.sent]
+
+
+def _assert_start_queued(role: SourceV1Role, client: _FakeClient) -> None:
+    """Request a start that can_start holds back: nothing is sent and no stream opens."""
+    assert not role.can_start
+    role.request_start()
+    assert client.sent == []
+    role.on_client_stream_start(_pcm_start_payload())
+    assert not role.stream_active
+
+
+def test_start_queued_until_source_state() -> None:
+    """A start requested before any client/state is sent once the source state arrives."""
+    client = _FakeClient()
+    role = SourceV1Role(client=client)  # type: ignore[arg-type]
+    role.on_connect()
+
+    _assert_start_queued(role, client)
+    role.on_initial_client_state(_SOURCE_STATE)
+    role.on_client_state(_SOURCE_STATE)
+
+    assert _commands(client) == ["start"]
+    role.on_client_stream_start(_pcm_start_payload())
+    assert role.stream_active
+
+
+def test_start_queued_until_a_state_carries_the_source_object() -> None:
+    """A later client/state without the source object does not release a queued start."""
+    client = _FakeClient()
+    role = SourceV1Role(client=client)  # type: ignore[arg-type]
+    role.on_connect()
+
+    _assert_start_queued(role, client)
+    role.on_client_state(ClientStatePayload(available=True))
+    assert client.sent == []
+
+    role.on_client_state(_SOURCE_STATE)
+    assert _commands(client) == ["start"]
+
+
+# DEPRECATED(spec-pr-195): remove in aiosendspin <version>
+def test_initial_state_without_source_object_allows_start() -> None:
+    """A tolerated pre-#195 client that never sends the source object can still be started."""
+    client = _FakeClient()
+    role = SourceV1Role(client=client)  # type: ignore[arg-type]
+    role.on_connect()
+    role.request_start()
+
+    role.on_initial_client_state(ClientStatePayload(available=True))
+    role.on_client_state(ClientStatePayload(available=True))
+
+    assert _commands(client) == ["start"]
+
+
+def test_start_queued_while_unavailable() -> None:
+    """A source that reports available: false is started once it is available again."""
+    client = _FakeClient()
+    client.available = False
+    role, _ = _connected_role(client)
+
+    _assert_start_queued(role, client)
+    role.on_client_state(ClientStatePayload(available=True, source=SourceStatePayload()))
+    client.available = True
+    role.on_availability_changed(old_available=False, new_available=True)
+
+    assert _commands(client) == ["start"]
+
+
+def test_start_sent_immediately_when_startable() -> None:
+    """An available client with a source object gets its start command at once."""
+    role, client = _connected_role()
+
+    assert role.can_start
+    role.request_start()
+    role.on_client_stream_start(_pcm_start_payload())
+
+    assert _commands(client) == ["start"]
+    assert role.stream_active
+
+
+def test_queued_start_is_sent_once() -> None:
+    """A queued start is consumed when sent, so later states send nothing more."""
+    client = _FakeClient()
+    role = SourceV1Role(client=client)  # type: ignore[arg-type]
+    role.on_connect()
+    role.request_start()
+
+    for _ in range(3):
+        role.on_client_state(_SOURCE_STATE)
+
+    assert _commands(client) == ["start"]
+
+
+def test_start_queued_while_role_awaits_activation_state() -> None:
+    """A role held for its activation client/state starts when the hold is released."""
+    client = _FakeClient()
+    client.held = True
+    role, _ = _connected_role(client)
+
+    _assert_start_queued(role, client)
+    client.held = False
+    role.on_hold_released()
+
+    assert _commands(client) == ["start"]
+
+
+def test_start_queued_after_reactivation_until_new_source_state() -> None:
+    """The source object must be reported again for each activation."""
+    role, client = _connected_role()
+    role.on_deactivate()
+
+    _assert_start_queued(role, client)
+    role.on_client_state(_SOURCE_STATE)
+
+    assert _commands(client) == ["start"]
+
+
+def test_timeout_release_without_source_state_keeps_start_queued() -> None:
+    """A hold released by the activation timeout still needs the source object."""
+    client = _FakeClient()
+    client.held = True
+    role = SourceV1Role(client=client)  # type: ignore[arg-type]
+    role.on_connect()
+
+    _assert_start_queued(role, client)
+    client.held = False
+    role.on_hold_released()
+    assert client.sent == []
+
+    role.on_client_state(_SOURCE_STATE)
+    assert _commands(client) == ["start"]
+
+
+def test_request_stop_cancels_a_queued_start() -> None:
+    """A stop withdraws a start that was still waiting to be sent."""
+    client = _FakeClient()
+    role = SourceV1Role(client=client)  # type: ignore[arg-type]
+    role.on_connect()
+    role.request_start()
+
+    role.request_stop()
+    role.on_client_state(_SOURCE_STATE)
+
+    assert _commands(client) == ["stop"]
+
+
+@pytest.mark.parametrize("teardown", ["on_deactivate", "on_disconnect"])
+def test_teardown_cancels_a_queued_start(teardown: str) -> None:
+    """Deactivation or disconnect withdraws a start that was still waiting to be sent."""
+    client = _FakeClient()
+    role = SourceV1Role(client=client)  # type: ignore[arg-type]
+    role.on_connect()
+    role.request_start()
+
+    getattr(role, teardown)()
+    role.on_connect()
+    role.on_initial_client_state(_SOURCE_STATE)
+    role.on_client_state(_SOURCE_STATE)
+
+    assert client.sent == []
+
+
+def _start_payload(
+    codec: AudioCodec,
+    *,
+    channels: int = 2,
+    bit_depth: int = 16,
+    sample_rate: int = 48000,
+    streaminfo_rate: int | None = None,
+) -> ClientStreamStartPayload:
+    header = None
+    if codec is AudioCodec.FLAC:
+        fields = (
+            ((streaminfo_rate or sample_rate) << 44)
+            | ((channels - 1) << 41)
+            | ((bit_depth - 1) << 36)
+        )
+        streaminfo = bytes([16, 0, 16, 0]) + bytes(6) + fields.to_bytes(8, "big") + bytes(16)
+        header = base64.b64encode(b"fLaC\x80\x00\x00\x22" + streaminfo).decode()
+    return ClientStreamStartPayload(
+        source=ClientStreamStartSource(
+            codec=codec,
+            channels=channels,
+            sample_rate=sample_rate,
+            bit_depth=bit_depth,
+            codec_header=header,
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("codec", "channels", "bit_depth", "decoded_bit_depth"),
+    [
+        (AudioCodec.PCM, 8, 16, 16),
+        (AudioCodec.PCM, 6, 24, 24),
+        (AudioCodec.PCM, 3, 32, 32),
+        (AudioCodec.PCM, 2, 8, 16),
+        (AudioCodec.FLAC, 2, 8, 16),
+        (AudioCodec.FLAC, 2, 12, 16),
+        (AudioCodec.FLAC, 2, 20, 24),
+    ],
+)
+def test_any_decodable_format_opens_at_its_decoded_format(
+    codec: AudioCodec, channels: int, bit_depth: int, decoded_bit_depth: int
+) -> None:
+    """The stream opens for any channel count up to 8 and announces the decoded PCM format."""
+    pytest.importorskip("av")
+    role, client = _make_role()
+
+    role.on_client_stream_start(_start_payload(codec, channels=channels, bit_depth=bit_depth))
+
+    assert role.stream_active
+    assert client.noncompliance == []
+    event = next(e for e in client.events if isinstance(e, SourceStreamStartedEvent))
+    assert event.audio_format == AudioFormat(
+        sample_rate=48000, bit_depth=decoded_bit_depth, channels=channels
+    )
+    assert event.handle.audio_format == event.audio_format
+
+
+async def test_8_bit_pcm_is_streamed_as_16_bit() -> None:
+    """8-bit PCM chunks come out of the handle widened to 16-bit samples."""
+    role, client = _make_role()
+    role.on_client_stream_start(_start_payload(AudioCodec.PCM, channels=1, bit_depth=8))
+    handle = next(e for e in client.events if isinstance(e, SourceStreamStartedEvent)).handle
+
+    role.on_binary_chunk(BinaryMessageType.SOURCE_AUDIO_CHUNK.value, 1, bytes([0x40, 0xC0]))
+    role.on_client_stream_end()
+
+    assert [chunk async for chunk, _ in handle] == [bytes([0x00, 0x40, 0x00, 0xC0])]
+
+
+@pytest.mark.parametrize(
+    ("codec", "bit_depth", "reason"),
+    [
+        (AudioCodec.PCM, 12, "a pcm bit_depth that is not a whole number of bytes"),
+        (AudioCodec.PCM, 0, "an unsupported bit_depth"),
+        (AudioCodec.PCM, 40, "an unsupported bit_depth"),
+        (AudioCodec.FLAC, 33, "an unsupported bit_depth"),
+    ],
+)
+def test_bit_depth_the_codec_cannot_carry_is_flagged(
+    codec: AudioCodec, bit_depth: int, reason: str
+) -> None:
+    """A depth the codec cannot express is flagged and opens no stream."""
+    role, client = _make_role()
+
+    role.on_client_stream_start(_start_payload(codec, bit_depth=bit_depth))
+
+    assert not role.stream_active
+    assert client.noncompliance == [f"client-stream/start announced {reason}"]
+
+
+@pytest.mark.parametrize(
+    ("codec", "sample_rate", "channels"),
+    [
+        (AudioCodec.PCM, 384_001, 2),
+        (AudioCodec.PCM, 48000, 9),
+        (AudioCodec.OPUS, 48000, 3),
+    ],
+)
+def test_format_beyond_server_limits_is_declined_without_a_flag(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    codec: AudioCodec,
+    sample_rate: int,
+    channels: int,
+) -> None:
+    """A rate or channel count beyond the server's limits opens no stream and warns once."""
+    monkeypatch.setattr("aiosendspin.server.roles.source.v1.opus_available", lambda: True)
+    role, client = _make_role()
+
+    with caplog.at_level(logging.WARNING):
+        for _ in range(2):
+            role.on_client_stream_start(
+                _start_payload(codec, channels=channels, sample_rate=sample_rate)
+            )
+
+    assert not role.stream_active
+    assert client.noncompliance == []
+    assert len(caplog.records) == 1
+
+
+def test_highest_supported_rate_opens_a_stream() -> None:
+    """384 kHz is within the server's limits."""
+    role, client = _make_role()
+
+    role.on_client_stream_start(_start_payload(AudioCodec.PCM, sample_rate=384_000))
+
+    assert role.stream_active
+    assert client.noncompliance == []
+
+
+def test_flac_streaminfo_rate_must_match_the_declared_rate() -> None:
+    """A STREAMINFO rate that differs from the declared rate is flagged and opens no stream."""
+    role, client = _make_role()
+
+    role.on_client_stream_start(_start_payload(AudioCodec.FLAC, streaminfo_rate=44100))
+
+    assert not role.stream_active
+    assert client.noncompliance == [
+        "client-stream/start FLAC STREAMINFO sample rate differs from sample_rate"
+    ]
+
+
+def test_source_running_ahead_of_real_time_is_dropped_without_a_flag(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Audio more than 1 s ahead of the server clock is dropped until the clock catches up."""
+    role, client = _make_role()
+    role.on_client_stream_start(_pcm_start_payload())
+    handle = next(e for e in client.events if isinstance(e, SourceStreamStartedEvent)).handle
+    chunk_100_ms = bytes(4800 * 4)
+
+    with caplog.at_level(logging.WARNING):
+        for _ in range(15):
+            role.on_binary_chunk(BinaryMessageType.SOURCE_AUDIO_CHUNK.value, 0, chunk_100_ms)
+        client._server.clock.advance_us(200_000)  # noqa: SLF001
+        role.on_binary_chunk(BinaryMessageType.SOURCE_AUDIO_CHUNK.value, 0, chunk_100_ms)
+
+    assert len(handle._queue) == 12  # noqa: SLF001
+    assert client.noncompliance == []
+    assert len(caplog.records) == 1
+
+
+def test_restarted_stream_keeps_the_lead() -> None:
+    """A new client-stream/start does not reset how far the source runs ahead."""
+    role, client = _make_role()
+    role.on_client_stream_start(_pcm_start_payload())
+    for _ in range(11):
+        role.on_binary_chunk(BinaryMessageType.SOURCE_AUDIO_CHUNK.value, 0, bytes(4800 * 4))
+
+    role.on_client_stream_start(_pcm_start_payload())
+    handle = [e for e in client.events if isinstance(e, SourceStreamStartedEvent)][-1].handle
+    role.on_binary_chunk(BinaryMessageType.SOURCE_AUDIO_CHUNK.value, 0, bytes(4800 * 4))
+
+    assert len(handle._queue) == 0  # noqa: SLF001
+
+
+def test_flac_chunks_that_decode_to_nothing_use_up_the_lead(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Undecodable FLAC chunks still cost their bytes, so a flood of them gets dropped unread."""
+    decoded: list[bytes] = []
+
+    class _RecordingDecoder(_PassthroughDecoder):
+        def decode(self, data: bytes) -> bytes:
+            decoded.append(data)
+            return b""
+
+    monkeypatch.setattr(
+        "aiosendspin.server.roles.source.v1.create_decoder", lambda *_a, **_k: _RecordingDecoder()
+    )
+    role, _client = _make_role()
+    role.on_client_stream_start(_start_payload(AudioCodec.FLAC))
+
+    # Half of 38 400 bytes is 100 ms at 48 kHz stereo 16-bit.
+    for _ in range(15):
+        role.on_binary_chunk(BinaryMessageType.SOURCE_AUDIO_CHUNK.value, 0, bytes(38_400))
+
+    assert len(decoded) == 11
+
+
+def test_flac_frames_dropped_after_decoding_use_up_the_lead(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Frames the decoder rejects still cost the samples their headers declare."""
+    decoded: list[bytes] = []
+
+    class _RejectingDecoder(_PassthroughDecoder):
+        def decode(self, data: bytes) -> bytes:
+            decoded.append(data)
+            raise ValueError
+
+    monkeypatch.setattr(
+        "aiosendspin.server.roles.source.v1.create_decoder", lambda *_a, **_k: _RejectingDecoder()
+    )
+    role, _client = _make_role()
+    role.on_client_stream_start(_start_payload(AudioCodec.FLAC))
+
+    # Two 4096-sample frames are 171 ms at 48 kHz.
+    chunk = flac_frame(4096) + flac_frame(4096, number=1)
+    for _ in range(10):
+        role.on_binary_chunk(BinaryMessageType.SOURCE_AUDIO_CHUNK.value, 0, chunk)
+
+    assert len(decoded) == 6
+
+
+def test_source_with_a_slightly_fast_clock_keeps_streaming() -> None:
+    """A capture clock 0.5% fast never builds up a lead that drops audio."""
+    role, client = _make_role()
+    role.on_client_stream_start(_pcm_start_payload())
+    handle = next(e for e in client.events if isinstance(e, SourceStreamStartedEvent)).handle
+    received = 0
+
+    for _ in range(3000):
+        role.on_binary_chunk(BinaryMessageType.SOURCE_AUDIO_CHUNK.value, 0, bytes(4824 * 4))
+        received += len(handle._queue)  # noqa: SLF001
+        handle._queue.clear()  # noqa: SLF001
+        client._server.clock.advance_us(100_000)  # noqa: SLF001
+
+    assert received == 3000

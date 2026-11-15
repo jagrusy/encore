@@ -1,0 +1,273 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="${ENCORE_CONFIG:-$ROOT_DIR/config/devices.yaml}"
+COMPOSE_FILE="$ROOT_DIR/hub/docker-compose.yml"
+
+usage() {
+  cat <<'EOF'
+Project Encore — Unified Home Mesh & Hardware Repurposing CLI
+
+Usage:
+  ./encore <command> [subcommand] [args...]
+
+Commands:
+  status                    Show hub container status, node reachability, and Bluetooth links
+  hub up [-d]               Start the Surface Pro 3 hub stack (Music Assistant, AirConnect, go2rtc, encore-brain, bt-multi-sink)
+  hub down                  Stop the Surface Pro 3 hub stack
+  hub restart               Restart the hub stack
+  hub logs [service]        Tail logs from hub services
+  hub tune-sp3              Configure a Linux Surface Pro 3 host for 24/7 headless server duty
+  node unlock-dot2 [name]   Interactive USB unlock (firebreak) + Overdub deployment for Echo Dot 2nd Gen (biscuit)
+  node unlock-show5         Interactive USB unlock (amonet-checkers) + Show Agent provisioning for Echo Show 5 1st Gen
+  bt sync                   Pair/connect Bluetooth satellite Echos defined in config/devices.yaml
+  sp3-ssh [cmd...]          Run an interactive shell or command on the Surface Pro 3 over Tailscale SSH
+  sync-upstreams            Compare vendored upstream commits against UPSTREAM.lock.json
+  help                      Show this help message
+EOF
+}
+
+require_config() {
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    echo "Config not found: $CONFIG_FILE"
+    echo "Creating it from config/devices.example.yaml..."
+    cp "$ROOT_DIR/config/devices.example.yaml" "$CONFIG_FILE"
+    echo "Created $CONFIG_FILE — edit it with your IPs, Bluetooth MACs, and RTSP URLs."
+  fi
+}
+
+cmd_status() {
+  require_config
+  echo "=== Project Encore Status ==="
+  echo "Config: $CONFIG_FILE"
+  echo ""
+
+  if command -v docker >/dev/null 2>&1; then
+    echo "--- Hub Containers ---"
+    docker compose -f "$COMPOSE_FILE" ps 2>/dev/null || echo "(Hub compose stack is not running)"
+  else
+    echo "--- Hub Containers ---"
+    echo "(docker not installed on this machine; run hub commands on your Linux Surface Pro 3)"
+  fi
+
+  echo ""
+  echo "--- Configured Smart Nodes & Cast Devices ---"
+  python3 - "$CONFIG_FILE" <<'PY'
+import pathlib, subprocess, sys
+
+cfg_path = pathlib.Path(sys.argv[1])
+text = cfg_path.read_text(encoding="utf-8")
+
+# Lightweight line parser so `./encore status` works without external PyYAML installed
+current_section = None
+items = []
+cur = {}
+for raw in text.splitlines():
+    line = raw.split("#", 1)[0].rstrip()
+    if not line.strip():
+        continue
+    if not line.startswith(" ") and line.endswith(":"):
+        if cur:
+            items.append((current_section, cur))
+            cur = {}
+        current_section = line[:-1].strip()
+        continue
+    stripped = line.lstrip()
+    if stripped.startswith("- "):
+        if cur:
+            items.append((current_section, cur))
+            cur = {}
+        stripped = stripped[2:]
+    if ":" in stripped and current_section in ("cast_devices", "smart_nodes", "bluetooth_satellites"):
+        k, v = stripped.split(":", 1)
+        cur[k.strip()] = v.strip().strip('"').strip("'")
+if cur:
+    items.append((current_section, cur))
+
+for section, item in items:
+    if section in ("cast_devices", "smart_nodes"):
+        ip = item.get("ip", "")
+        name = item.get("id", item.get("name", "unknown"))
+        state = "no-ip"
+        if ip:
+            res = subprocess.run(["ping", "-c", "1", "-W", "1", ip], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            state = "UP" if res.returncode == 0 else "UNREACHABLE"
+        print(f"  [{section}] {name:20s} ip={ip:15s} status={state}")
+    elif section == "bluetooth_satellites":
+        name = item.get("id", "unknown")
+        mac = item.get("bt_mac", "")
+        host = item.get("host_node", "")
+        print(f"  [bt_satellite] {name:16s} mac={mac:17s} host={host}")
+PY
+}
+
+cmd_hub() {
+  local action="${1:-}"
+  shift || true
+  case "$action" in
+    up)
+      require_config
+      if [[ ! -f "$ROOT_DIR/hub/.env" && -f "$ROOT_DIR/hub/.env.example" ]]; then
+        cp "$ROOT_DIR/hub/.env.example" "$ROOT_DIR/hub/.env"
+      fi
+      docker compose -f "$COMPOSE_FILE" up -d --build "$@"
+      ;;
+    down)
+      docker compose -f "$COMPOSE_FILE" down "$@"
+      ;;
+    restart)
+      docker compose -f "$COMPOSE_FILE" restart "$@"
+      ;;
+    logs)
+      docker compose -f "$COMPOSE_FILE" logs -f --tail=100 "$@"
+      ;;
+    tune-sp3)
+      tune_surface_pro_3
+      ;;
+    *)
+      echo "Unknown hub subcommand: $action" >&2
+      usage
+      exit 1
+      ;;
+  esac
+}
+
+tune_surface_pro_3() {
+  if [[ "$(uname -s)" != "Linux" ]]; then
+    echo "Run './encore hub tune-sp3' directly on the Linux Surface Pro 3." >&2
+    exit 1
+  fi
+  echo "=== Tuning Surface Pro 3 for 24/7 Headless Mesh Duty ==="
+  echo "1. Configuring systemd-logind to ignore lid close / idle suspend..."
+  sudo mkdir -p /etc/systemd/logind.conf.d
+  sudo tee /etc/systemd/logind.conf.d/99-encore-always-on.conf >/dev/null <<'EOF'
+[Login]
+HandleLidSwitch=ignore
+HandleLidSwitchExternalPower=ignore
+HandleLidSwitchDocked=ignore
+IdleAction=ignore
+EOF
+  sudo systemctl restart systemd-logind || true
+
+  echo "2. Installing BlueZ, PipeWire, and Intel VA-API prerequisites (Debian/Ubuntu)..."
+  if command -v apt-get >/dev/null 2>&1; then
+    sudo apt-get update
+    sudo apt-get install -y bluez pipewire pipewire-audio wireplumber libspa-0.2-bluetooth vainfo intel-media-va-driver
+  fi
+
+  echo "3. Checking Intel QuickSync (/dev/dri)..."
+  ls -l /dev/dri || echo "Warning: /dev/dri not found"
+  echo "Done. Tip: Set consoleblank=60 in GRUB_CMDLINE_LINUX_DEFAULT to turn off the SP3 backlight after 60s."
+}
+
+cmd_node() {
+  local action="${1:-}"
+  shift || true
+  case "$action" in
+    unlock-dot2)
+      local dot_name="${1:-living-room-dot}"
+      echo "=== Echo Dot 2nd Gen (biscuit) Unlock & Overdub Provisioning ==="
+      echo "Step 1: Plug your Echo Dot 2nd Gen into this computer via Micro-USB (do NOT connect it to Wi-Fi yet)."
+      echo "Step 2: Running vendored firebreak unlock..."
+      if command -v uv >/dev/null 2>&1; then
+        (cd "$ROOT_DIR/nodes/echo-dot-gen2/firebreak" && uv run firebreak unlock)
+      else
+        python3 -m firebreak unlock
+      fi
+      echo ""
+      echo "Step 3: After completing Wi-Fi setup on the rooted Dot and connecting over ADB,"
+      echo "run the Encore Overdub provisioning script:"
+      echo "  $ROOT_DIR/nodes/echo-dot-gen2/provision.sh $dot_name"
+      ;;
+    unlock-show5)
+      echo "=== Echo Show 5 1st Gen (checkers) BootROM Unlock ==="
+      echo "1. Power off the Echo Show 5 and unplug power."
+      echo "2. Run the bootrom exploit script from nodes/echo-show5-gen1/amonet-checkers:"
+      echo "   cd $ROOT_DIR/nodes/echo-show5-gen1/amonet-checkers && sudo ./bootrom-step.sh"
+      echo "3. Hold Mute + Volume Down + Volume Up while plugging in Micro-USB + power."
+      echo "4. Once in hacked fastboot, run: sudo ./fastboot-step.sh"
+      echo "5. Flash LineageOS 18.1 (checkers) in TWRP, enable ADB, then run:"
+      echo "   $ROOT_DIR/nodes/echo-show5-gen1/show-agent/provision-show5.sh <node-id> <hub-ip>"
+      ;;
+    *)
+      echo "Unknown node subcommand: $action" >&2
+      usage
+      exit 1
+      ;;
+  esac
+}
+
+cmd_bt() {
+  local action="${1:-}"
+  shift || true
+  case "$action" in
+    sync)
+      require_config
+      if [[ "$(uname -s)" != "Linux" ]]; then
+        echo "Run './encore bt sync' on the Linux Surface Pro 3 host." >&2
+        exit 1
+      fi
+      python3 "$ROOT_DIR/hub/bt-multi-sink/bt_sink_manager.py" --config "$CONFIG_FILE" --pair-once
+      ;;
+    *)
+      echo "Unknown bt subcommand: $action" >&2
+      exit 1
+      ;;
+  esac
+}
+
+cmd_sync_upstreams() {
+  python3 - "$ROOT_DIR/UPSTREAM.lock.json" <<'PY'
+import json, pathlib, subprocess, sys
+
+lock_path = pathlib.Path(sys.argv[1])
+data = json.loads(lock_path.read_text(encoding="utf-8"))
+for name, info in data["upstreams"].items():
+    remote_head = subprocess.check_output(
+        ["git", "ls-remote", info["url"], info["branch"]], text=True
+    ).split()[0]
+    status = "UP-TO-DATE" if remote_head == info["commit"] else f"NEW COMMIT: {remote_head[:12]}"
+    print(f"{name:16s} vendored={info['commit'][:12]}  upstream={status}  ({info['url']})")
+PY
+}
+
+cmd_sp3_ssh() {
+  local target="${ENCORE_SP3_HOST:-encore-sp3}"
+  local user="${ENCORE_SP3_USER:-root}"
+  local key_file="$ROOT_DIR/.ssh/encore_sp3_ed25519"
+  local ssh_opts=("-o" "StrictHostKeyChecking=accept-new")
+  if [[ -f "$key_file" ]]; then
+    ssh_opts+=("-i" "$key_file")
+  fi
+  if ! command -v ssh >/dev/null 2>&1; then
+    echo "ssh client not found." >&2
+    exit 1
+  fi
+  if [[ $# -eq 0 ]]; then
+    exec ssh "${ssh_opts[@]}" "${user}@${target}"
+  else
+    exec ssh "${ssh_opts[@]}" "${user}@${target}" "$@"
+  fi
+}
+
+main() {
+  local cmd="${1:-help}"
+  shift || true
+  case "$cmd" in
+    status) cmd_status "$@" ;;
+    hub) cmd_hub "$@" ;;
+    node) cmd_node "$@" ;;
+    bt) cmd_bt "$@" ;;
+    sp3-ssh) cmd_sp3_ssh "$@" ;;
+    sync-upstreams) cmd_sync_upstreams "$@" ;;
+    help|-h|--help) usage ;;
+    *)
+      echo "Unknown command: $cmd" >&2
+      usage
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"
